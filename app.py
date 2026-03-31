@@ -182,6 +182,8 @@ QPushButton[primary="true"] { background: #1a1a1a; border: 1px solid #8a8a8a; fo
 QPushButton[primary="true"]:hover { background: #202020; border: 1px solid #b0b0b0; }
 QPushButton[danger="true"] { background: #1a0505; border: 1px solid #6a2a2a; color: #ffd3d3; }
 QPushButton[danger="true"]:hover { background: #220707; border: 1px solid #a04040; }
+QPushButton[success="true"] { background: #051a05; border: 1px solid #2a6a2a; color: #b0ffb0; font-weight: 700; }
+QPushButton[success="true"]:hover { background: #072207; border: 1px solid #40a040; }
 QProgressBar {
     border: 1px solid #1f1f1f;
     border-radius: 10px;
@@ -341,6 +343,16 @@ QPushButton[danger="true"]:hover {
 QPushButton[danger="true"]:pressed {
   background: rgba(238,208,208,255);
   border: 1px solid rgba(200,70,70,115);
+}
+QPushButton[success="true"] {
+  background: rgba(60,180,60,30);
+  border: 1px solid rgba(60,160,60,120);
+  color: rgba(20,100,20,245);
+  font-weight: 800;
+}
+QPushButton[success="true"]:hover {
+  background: rgba(60,180,60,50);
+  border: 1px solid rgba(40,140,40,160);
 }
 
 QPushButton[tool="true"] {
@@ -794,6 +806,7 @@ class ZoomPanCanvas(QWidget):
         self._bytes_per_line = int(rgb_u8.strides[0])
         self.update()
         self.view_changed.emit()
+
 
     def clear_rgb(self):
         self._rgb = None
@@ -1480,7 +1493,7 @@ class MainWindow(QMainWindow):
         self.cpsam_watch_timer.timeout.connect(self._poll_cpsam_done_markers)
 
         self.active_tool: Optional[str] = None
-        self.paint_color = "blue"   # "blue", "pink", "red", "green", or "black"
+        self.paint_color = "green"  # "blue", "pink", "red", "green", or "black"
         self.preview_contrast_percent = 100
         self.current_out_dir: Optional[Path] = None
         self.csv_filename = "results.csv"
@@ -1510,7 +1523,7 @@ class MainWindow(QMainWindow):
         self.out_dir_edit.setPlaceholderText("Choose output directory")
         self.out_dir_edit.setReadOnly(True)
 
-        self.btn_process_old = QPushButton("Old Algorithm")
+        self.btn_process_old = QPushButton("ColonyNet")
         self.btn_process_old.setProperty("primary", True)
         self.btn_process_cpsam = QPushButton("CPSAM")
         self.btn_process_cpsam.setProperty("primary", True)
@@ -1606,7 +1619,7 @@ class MainWindow(QMainWindow):
         self.color_combo.view().viewport().setAutoFillBackground(True)
         self.color_combo.view().setSpacing(0)
         self.color_combo.addItems(["Blue", "Pink", "Red", "Green", "Black"])
-        self.color_combo.setCurrentText("Blue")
+        self.color_combo.setCurrentText("Green")
         self.color_combo.currentTextChanged.connect(self.on_color_changed)
 
         self.contrast_slider = QSlider(Qt.Horizontal)
@@ -1617,11 +1630,16 @@ class MainWindow(QMainWindow):
         self.contrast_slider.valueChanged.connect(self.on_contrast_changed)
         self.contrast_value_lbl = QLabel(f"{self.preview_contrast_percent}%")
 
+        self.count_info_lbl = QLabel("")
+        self.count_info_lbl.setWordWrap(True)
+        self.count_info_lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.count_info_lbl.setTextFormat(Qt.RichText)
+
         self.btn_clear_annotations = QPushButton("Clear Annotations")
         self.btn_clear_annotations.setProperty("danger", True)
 
         self.btn_update_count = QPushButton("Update Count")
-        self.btn_update_count.setProperty("primary", True)
+        self.btn_update_count.setProperty("success", True)
 
         self.btn_save = QPushButton("Save")
         self.btn_save.setProperty("primary", True)
@@ -2074,6 +2092,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(contrast_row)
 
         layout.addSpacing(10)
+        layout.addWidget(self.count_info_lbl)
+        layout.addSpacing(6)
         layout.addWidget(self.btn_clear_annotations)
         layout.addWidget(self.btn_update_count)
         layout.addWidget(self.btn_save)
@@ -2244,6 +2264,9 @@ class MainWindow(QMainWindow):
         self._load_logo()
         self._force_table_dark()
         self._apply_combo_popup_theme()
+        row = self._current_row()
+        if row is not None and hasattr(self, "count_info_lbl"):
+            self._update_count_info_lbl(row)
 
     def _build_right_panel_with_post(self) -> QWidget:
         right_root = QWidget()
@@ -2684,7 +2707,6 @@ class MainWindow(QMainWindow):
         self,
         base: np.ndarray,
         pp: PostprocessState,
-        count_overlays: Optional[List[Dict[str, Optional[str]]]] = None,
     ) -> np.ndarray:
         out = base.copy().astype(np.uint8)
         h, w = out.shape[:2]
@@ -2731,47 +2753,6 @@ class MainWindow(QMainWindow):
                 6,
                 cv2.LINE_AA,
             )
-
-        # GT / algorithm / diff overlays stacked at top-left.
-        if count_overlays:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 2.0
-            thickness = 5
-            margin = 0
-            y0 = 75
-            line_gap = 65
-            pad = 12
-            overlay_gap = 18  # extra vertical gap between successive overlay blocks
-            y_cursor: dict = {}  # running top-baseline per position
-            for overlay in count_overlays:
-                pos = overlay.get("position") or "left"
-                lines = [
-                    (overlay.get("gt_text"), (255, 255, 0)),
-                    (overlay.get("algo_text"), (0, 255, 0)),
-                    (overlay.get("diff_text"), (255, 0, 0)),
-                    (overlay.get("count_text"), (0, 200, 255)),
-                ]
-                visible_lines = [(text, color) for text, color in lines if text]
-                if not visible_lines:
-                    continue
-                cur_y = y_cursor.get(pos, y0)
-                # Measure all lines to draw a black background rectangle
-                text_sizes = [cv2.getTextSize(t, font, font_scale, thickness) for t, _ in visible_lines]
-                max_tw = max(sz[0][0] for sz in text_sizes)
-                text_h = text_sizes[0][0][1]
-                base_line = text_sizes[0][1]
-                n = len(visible_lines)
-                rect_top = max(0, cur_y - text_h - pad)
-                rect_bot = min(h - 1, cur_y + (n - 1) * line_gap + base_line + pad)
-                rect_left = max(0, margin - pad)
-                rect_right = margin + max_tw + pad
-                cv2.rectangle(out, (rect_left, rect_top), (rect_right, rect_bot), (0, 0, 0), -1)
-                for line_i, (text, color) in enumerate(visible_lines):
-                    x = margin
-                    y = cur_y + line_i * line_gap
-                    cv2.putText(out, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
-                # Advance cursor so the next overlay for this position appears below
-                y_cursor[pos] = rect_bot + overlay_gap
 
         return out
 
@@ -2832,19 +2813,53 @@ class MainWindow(QMainWindow):
         adjusted = (img_f - 127.5) * alpha + 127.5
         return np.clip(adjusted, 0, 255).astype(np.uint8)
 
+    def _update_count_info_lbl(self, row: "ResultRow"):
+        overlays = self._get_count_overlays_for_row(row, current_count=row.current_count)
+        if not overlays:
+            self.count_info_lbl.setText("")
+            return
+        is_dark = getattr(self, "theme_mode", "dark") != "light"
+        if is_dark:
+            bg = "#000000"
+            gt_col = "#ffff00"
+            algo_col = "#00ee00"
+            diff_col = "#ff5555"
+            count_col = "#00c8ff"
+        else:
+            bg = "#ffffff"
+            gt_col = "#8a7000"
+            algo_col = "#006600"
+            diff_col = "#cc0000"
+            count_col = "#0060aa"
+        parts = []
+        for ov in overlays:
+            if ov.get("gt_text"):
+                parts.append(f'<span style="color:{gt_col};">{ov["gt_text"]}</span>')
+            if ov.get("algo_text"):
+                parts.append(f'<span style="color:{algo_col};">{ov["algo_text"]}</span>')
+            if ov.get("diff_text"):
+                parts.append(f'<span style="color:{diff_col};">{ov["diff_text"]}</span>')
+            if ov.get("count_text"):
+                parts.append(f'<span style="color:{count_col};">{ov["count_text"]}</span>')
+        html = "<br>".join(parts)
+        self.count_info_lbl.setText(
+            f'<div style="background:{bg};padding:6px;border-radius:4px;'
+            f'font-size:13pt;font-weight:bold;">{html}</div>'
+        )
+
     def on_table_select(self):
         row = self._current_row()
         if row is None:
             return
         want_masked = self.preview_mode_masked.isChecked()
-        count_overlays = self._get_count_overlays_for_row(row, current_count=row.current_count)
+        self._update_count_info_lbl(row)
         try:
             original, masked = self._get_base_images(row)
             if want_masked:
                 self._ensure_masked_seed(row, masked.shape[0], masked.shape[1])
-                composed = self._compose_with_annotations(masked, row.pp_masked, count_overlays)
+                composed = self._compose_with_annotations(masked, row.pp_masked)
             else:
-                composed = self._compose_with_annotations(original, row.pp_original, count_overlays)
+                composed = self._compose_with_annotations(original, row.pp_original)
             composed = self._apply_preview_contrast(composed)
             self.preview_label.set_rgb(composed)
         except Exception:
@@ -3193,9 +3208,8 @@ class MainWindow(QMainWindow):
             for r in targets:
                 _, masked = self._get_base_images(r)
 
-                count_overlays = self._get_count_overlays_for_row(r, current_count=r.current_count)
                 self._ensure_masked_seed(r, masked.shape[0], masked.shape[1])
-                mask_ann = self._compose_with_annotations(masked, r.pp_masked, count_overlays)
+                mask_ann = self._compose_with_annotations(masked, r.pp_masked)
                 mask_rgb = self._build_count_mask_rgb(r, masked.shape[0], masked.shape[1])
 
                 stem = Path(r.source_image).stem
@@ -3467,6 +3481,25 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
                 self.on_table_select()
         return matched_rows
 
+    def _export_mask_for_web(self, r: "ResultRow", kind: str) -> Optional[str]:
+        """Write current in-memory mask to a temp PNG and return its path, or None."""
+        pp = r.pp_masked
+        if kind == "green":
+            mask = pp.paint_mask_green
+        else:
+            mask = pp.paint_mask_yellow
+        if mask is None or not np.any(mask):
+            return None
+        try:
+            suffix = f"_web_{kind}.png"
+            stem = Path(r.source_image).stem
+            tmp_dir = Path(r.source_image).parent
+            tmp_path = tmp_dir / f"{stem}{suffix}"
+            cv2.imwrite(str(tmp_path), mask)
+            return str(tmp_path)
+        except Exception:
+            return None
+
     def on_web_ui_help(self):
         rows = []
         selected_paths = set(self._get_checked_or_all_source_paths())
@@ -3481,6 +3514,30 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
             base_tifs = [p for p in r.tif_paths if "_annotated" not in Path(p).stem.lower()]
             base_expts = [p for p in r.expt_paths if "_annotated" not in Path(p).stem.lower()]
             base_post_masks = [p for p in r.post_mask_paths if "_annotated" not in Path(p).stem.lower()]
+
+            # If user has edited masks in-app, export the current in-memory state so
+            # the webapp session shows the same masks the user is looking at.
+            if r.masked_green_initialized:
+                exported_green = self._export_mask_for_web(r, "green")
+                exported_yellow = self._export_mask_for_web(r, "yellow")
+                if exported_green:
+                    base_post_masks = [exported_green]
+                if exported_yellow:
+                    # Build a fake tif by stitching yellow into an overlay RGB PNG
+                    try:
+                        h, w = r.pp_masked.paint_mask_yellow.shape[:2]
+                        overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+                        ym = r.pp_masked.paint_mask_yellow > 0
+                        overlay_rgb[ym] = [255, 255, 0]
+                        # also paint green so the base image is still useful
+                        gm = r.pp_masked.paint_mask_green > 0
+                        overlay_rgb[gm] = [0, 255, 0]
+                        tmp_overlay = Path(r.source_image).parent / f"{Path(r.source_image).stem}_web_overlay.png"
+                        cv2.imwrite(str(tmp_overlay), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+                        base_tifs = [str(tmp_overlay)]
+                    except Exception:
+                        pass
+
             rows.append(
                 {
                     "image": Path(src).name,
@@ -3663,6 +3720,40 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
             return None
         return None
 
+    def _apply_webapp_annotated_to_row(self, row: "ResultRow", png_path: str) -> bool:
+        """
+        Read a webapp-saved annotated PNG (base image + overlay composite) and
+        decode its pixel colors back into the row's pp_masked masks.
+        Green pixels → paint_mask_green, yellow → paint_mask_yellow.
+        Removes any pixels that were erased in the webapp (i.e. no longer green/yellow).
+        Returns True if something changed.
+        """
+        try:
+            bgr = cv2.imread(png_path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return False
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.int32)
+            h, w = rgb.shape[:2]
+
+            self._ensure_masked_seed(row, h, w)
+            pp = row.pp_masked
+            pp.ensure_shape(h, w)
+
+            r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+
+            # Green: high G, low R, low B
+            green_mask = (g > 180) & (r < 80) & (b < 80)
+            # Yellow: high R+G, low B
+            yellow_mask = (r > 180) & (g > 180) & (b < 80)
+
+            pp.paint_mask_green = green_mask.astype(np.uint8) * 255
+            pp.paint_mask_yellow = yellow_mask.astype(np.uint8) * 255
+            row.user_modified_mask = True
+            row._masked_cache = None
+            return True
+        except Exception:
+            return False
+
     def _poll_web_session_saved(self):
         sid = self.web_session_id
         if not sid:
@@ -3691,9 +3782,21 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
         if not new_paths:
             return
 
-        loaded = self._attach_cpsam_outputs_to_originals(new_paths)
+        loaded = 0
+        for png_path in new_paths:
+            png_stem = Path(png_path).stem.lower()
+            for row in self.results:
+                src_stem = Path(row.source_image).stem.lower()
+                if png_stem.startswith(src_stem):
+                    if self._apply_webapp_annotated_to_row(row, png_path):
+                        loaded += 1
+                    break
+
         if loaded > 0:
             self.status_lbl.setText(f"iPad annotations synced: matched {loaded} image(s).")
+            self._force_table_dark()
+            if self.table.selectionModel().hasSelection():
+                self.on_table_select()
 
     def _get_ssh_input_paths(self) -> List[str]:
         targets = self._get_save_targets()

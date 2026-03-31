@@ -67,6 +67,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -99,23 +100,23 @@ _PREPROCESS_CACHE_MAXSIZE = 128
 
 @dataclass
 class TuningParams:
-    hsv_v_start: float = 0.635
+    hsv_v_start: float = 0.3
     hsv_v_step: float = 0.05
     hsv_v_min: float = 0.35
     hsv_s_min: float = 0.00
-    hsv_err_tol: float = 0.0065
+    hsv_err_tol: float = 0.0061
     h_ref_frac: float = 0.12   # fraction of p10-p90 gray range used as imextendedmin h in reference
     hsv_extent_min: float = 0.23
-    hsv_open_disk_small: int = 3
+    hsv_open_disk_small: int = 1
     hsv_open_disk_large: int = 16
-    min_object_area: int = 100
+    min_object_area: int = 150
     small_area_quantile: float = 0.75
     small_cluster_extent_min: float = 0.20
     nonsmall_cluster_ecc_min: float = 0.99
     nonsmall_cluster_extent_min: float = 0.20
     colony_circularity_min: float = 0.09
-    ws_thresh_abs_frac: float = 0.05
-    ws_gauss_sigma: float = 1.0
+    ws_thresh_abs_frac: float = 0.02
+    ws_gauss_sigma: float = 0.3
     uncountable_cutoff: int = 300
     uncountable_precheck_cutoff: int = 400
 
@@ -1370,10 +1371,12 @@ def count_cfu_app2(
             save_tiff_rgb(expt_tif, expt)
             out_paths.append(str(expt_tif))
 
-        # Save the post-cleanup mask so the desktop app can treat the
-        # algorithm segmentation as an editable mask layer instead of a
-        # baked green overlay.
-        post_tif = base.with_name(base.name + "__post").with_suffix(".tif")
+        # Save the post-cleanup mask into a hidden cache subfolder so it
+        # doesn't clutter the output directory. The desktop app reads it
+        # from there to seed the editable mask layer.
+        post_cache_dir = base.parent / ".mask_cache"
+        post_cache_dir.mkdir(parents=True, exist_ok=True)
+        post_tif = post_cache_dir / (base.name + "__post.tif")
         save_tiff_rgb(post_tif, bw_post_rgb)
         out_paths.append(str(post_tif))
 

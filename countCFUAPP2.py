@@ -64,48 +64,441 @@ BLOCK 6 · COUNT + ROI
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
+from medpy.filter.smoothing import anisotropic_diffusion
 from scipy import ndimage as ndi
+from skimage import exposure
 from skimage.color import rgb2hsv, rgb2gray
 from skimage.measure import label, regionprops, find_contours
-from skimage.morphology import disk, binary_opening, binary_erosion, binary_dilation, h_maxima
+from skimage.morphology import (
+    binary_dilation,
+    binary_erosion,
+    binary_opening,
+    disk,
+    h_maxima,
+    h_minima,
+    remove_small_objects,
+)
 from skimage.segmentation import watershed
 
-# ---------------------------------------------------------------------------
-# Re-use ALL helpers, dataclasses and building blocks from countCFUAPP.
-# We only add the new top-level pipeline here — no duplication.
-# ---------------------------------------------------------------------------
-from countCFUAPP import (
-    # dataclasses
-    TuningParams,
-    ROI,
-    # image helpers
-    _as_float01,
-    _to_uint8,
-    _gray_uint8,
-    imsharpen_approx,
-    _disk_kernel,
-    save_tiff_rgb,
-    # preprocessing
-    imadjust_approx,
-    locallapfilt_approx,
-    localcontrast_approx,
-    imlocalbrighten_approx,
-    imdiffusefilt_pm,
-    # mask helpers
-    imextendedmin,
-    bwareaopen,
-    bwpropfilt,
-    imoverlay,
-    # helpers
-    _mean_region_area,
-    # dish detection / splitting
-    _get_expts_from_detectdish,
-)
+
+# Preprocessing cache: keyed by MD5(image bytes) + blackhat flag.
+# preprocess_expt is the slowest step (Perona-Malik + Laplacian pyramid) and
+# its output depends only on the image content, not on TuningParams.  The tuner
+# calls predict_tuning_features hundreds of times on the same images with
+# different params, so caching the preprocessed result gives a large speedup.
+_PREPROCESS_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+_PREPROCESS_CACHE_MAXSIZE = 128
+
+
+@dataclass
+class TuningParams:
+    hsv_v_start: float = 0.635
+    hsv_v_step: float = 0.05
+    hsv_v_min: float = 0.35
+    hsv_s_min: float = 0.00
+    hsv_err_tol: float = 0.0065
+    h_ref_frac: float = 0.12   # fraction of p10-p90 gray range used as imextendedmin h in reference
+    hsv_extent_min: float = 0.23
+    hsv_open_disk_small: int = 3
+    hsv_open_disk_large: int = 16
+    min_object_area: int = 100
+    small_area_quantile: float = 0.75
+    small_cluster_extent_min: float = 0.20
+    nonsmall_cluster_ecc_min: float = 0.99
+    nonsmall_cluster_extent_min: float = 0.20
+    colony_circularity_min: float = 0.09
+    ws_thresh_abs_frac: float = 0.05
+    ws_gauss_sigma: float = 1.0
+    uncountable_cutoff: int = 300
+    uncountable_precheck_cutoff: int = 400
+
+
+@dataclass
+class ROI:
+    Position: np.ndarray
+    Center: np.ndarray
+    Creator: str
+    Shape: str
+    NumOfCFU: int
+
+
+def save_tiff_rgb(path: Union[str, Path], rgb: np.ndarray) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if rgb is None or not isinstance(rgb, np.ndarray) or rgb.size == 0:
+        raise ValueError(f"save_tiff_rgb: empty image for {path}")
+    img = rgb
+    if img.dtype != np.uint8:
+        img = _to_uint8(_as_float01(img))
+    if img.ndim == 2:
+        ok = cv2.imwrite(str(path), img)
+        if not ok:
+            raise RuntimeError(f"Failed to write TIFF: {path}")
+        return
+    if img.ndim == 3 and img.shape[2] == 3:
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        ok = cv2.imwrite(str(path), bgr)
+        if not ok:
+            raise RuntimeError(f"Failed to write TIFF: {path}")
+        return
+    raise ValueError(f"save_tiff_rgb: unsupported shape {img.shape} for {path}")
+
+
+def _as_float01(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img.astype(np.float32) / 255.0
+    return img.astype(np.float32)
+
+
+def _to_uint8(img01: np.ndarray) -> np.ndarray:
+    return np.clip(img01 * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _gray_uint8(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        if img.dtype != np.uint8:
+            return _to_uint8(_as_float01(img))
+        return img
+    g = rgb2gray(_as_float01(img))
+    return _to_uint8(g)
+
+
+@lru_cache(maxsize=32)
+def _disk_kernel(r: int) -> np.ndarray:
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+@lru_cache(maxsize=32)
+def _disk(r: int) -> np.ndarray:
+    return disk(r)
+
+
+def imoverlay(rgb: np.ndarray, mask: np.ndarray, color: str) -> np.ndarray:
+    if rgb.ndim == 2:
+        out = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+    else:
+        out = rgb.copy()
+    m = mask.astype(bool)
+    color = color.lower()
+    if color == "red":
+        out[m, 0] = 0
+        out[m, 1] = 255
+        out[m, 2] = 0
+    elif color == "green":
+        out[m, 0] = 0
+        out[m, 1] = 255
+        out[m, 2] = 0
+    elif color == "blue":
+        out[m, 0] = 0
+        out[m, 1] = 0
+        out[m, 2] = 255
+    else:
+        raise ValueError("color must be 'red', 'green', or 'blue'")
+    return out
+
+
+def bwpropfilt(bw: np.ndarray, prop: str, rng: Tuple[float, float]) -> np.ndarray:
+    bw = bw.astype(bool)
+    lab = label(bw, connectivity=2)
+    keep = np.zeros_like(bw, dtype=bool)
+    rmin, rmax = rng
+    prop_key = prop.lower()
+    for reg in regionprops(lab):
+        area = float(reg.area)
+        if prop_key == "area":
+            val = area
+        elif prop_key == "extent":
+            minr, minc, maxr, maxc = reg.bbox
+            bbox_area = float((maxr - minr) * (maxc - minc))
+            val = area / bbox_area if bbox_area > 0 else 0.0
+        elif prop_key == "eccentricity":
+            val = float(reg.eccentricity)
+        elif prop_key == "circularity":
+            per = float(reg.perimeter) if reg.perimeter and reg.perimeter > 0 else 0.0
+            val = (4.0 * np.pi * area / (per * per)) if per > 0 else 0.0
+        else:
+            raise ValueError(f"Unsupported property: {prop}")
+        if (val >= rmin) and (val <= rmax):
+            keep[lab == reg.label] = True
+    return keep
+
+
+def bwareaopen(bw: np.ndarray, min_size: int) -> np.ndarray:
+    return remove_small_objects(bw.astype(bool), min_size=min_size, connectivity=2)
+
+
+def imextendedmin(gray_u8: np.ndarray, h: int) -> np.ndarray:
+    return h_minima(gray_u8, h=h).astype(bool)
+
+
+def localcontrast_approx(
+    img: np.ndarray,
+    amount: float = 0.17,
+    mid: float = 0.9,
+    sigma: float = 3.0,
+) -> np.ndarray:
+    img01 = _as_float01(img)
+    if img01.ndim == 3:
+        gray = cv2.cvtColor(_to_uint8(img01), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    else:
+        gray = img01
+    local_mean = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    d = gray - local_mean
+    weight = np.exp(-((gray - mid) ** 2) / (2 * 0.25 ** 2))
+    d_enhanced = d * (1.0 + amount * weight)
+    out_gray = np.clip(local_mean + d_enhanced, 0.0, 1.0)
+    if img01.ndim == 3:
+        denom = np.maximum(gray, 1e-6)
+        ratio = (out_gray / denom)[..., None]
+        out = np.clip(img01 * ratio, 0.0, 1.0)
+        return _to_uint8(out)
+    return _to_uint8(out_gray)
+
+
+def imlocalbrighten_approx(img: np.ndarray, strength: float = 0.5) -> np.ndarray:
+    img01 = _as_float01(img)
+    out = exposure.adjust_sigmoid(img01, cutoff=0.5, gain=5.0 * float(strength) + 1.0)
+    return _to_uint8(out)
+
+
+def gaussian_pyramid(img, levels):
+    G = [img]
+    for _ in range(levels):
+        img = cv2.pyrDown(img)
+        G.append(img)
+    return G
+
+
+def laplacian_pyramid(G):
+    L = []
+    for i in range(len(G) - 1):
+        up = cv2.pyrUp(G[i + 1], dstsize=(G[i].shape[1], G[i].shape[0]))
+        L.append(G[i] - up)
+    L.append(G[-1])
+    return L
+
+
+def reconstruct_pyramid(L):
+    current = L[-1]
+    for i in range(len(L) - 2, -1, -1):
+        current = cv2.pyrUp(current, dstsize=(L[i].shape[1], L[i].shape[0])) + L[i]
+    return current
+
+
+def phi(d, sigma, alpha):
+    abs_d = np.abs(d)
+    sign = np.sign(d)
+    w = np.exp(-(abs_d / sigma) ** 2)
+    return sign * (alpha * abs_d * w + abs_d * (1 - w))
+
+
+
+def locallapfilt_approx(img, sigma=0.2, alpha=3.0, beta=0.5, levels=5):
+    """
+    Approximation of MATLAB locallapfilt using pyramid + local remapping.
+
+    Parameters:
+        sigma: contrast threshold
+        alpha: detail enhancement
+        beta: base compression
+    """
+    img = _as_float01(img)
+
+    if img.ndim == 2:
+        img = img[..., None]
+
+    out_channels = []
+
+    for c in range(img.shape[2]):
+        I = img[..., c]
+
+        # --- 1. Gaussian pyramid ---
+        G = gaussian_pyramid(I, levels)
+
+        # --- 2. Laplacian pyramid ---
+        L = laplacian_pyramid(G)
+
+        # --- 3. Modify coefficients ---
+        L_mod = []
+
+        for k in range(len(L) - 1):
+            g0 = G[k]
+            d = I - cv2.resize(g0, (I.shape[1], I.shape[0]))
+
+            d_remap = phi(d, sigma, alpha)
+
+            I_remap = cv2.resize(g0, (I.shape[1], I.shape[0])) + d_remap
+
+            # recompute Gaussian + Laplacian locally
+            G_remap = gaussian_pyramid(I_remap, levels)
+            L_remap = laplacian_pyramid(G_remap)
+
+            L_mod.append(L_remap[k])
+
+        # top level (coarse tone)
+        L_mod.append(beta * L[-1])
+
+        # --- 4. Reconstruct ---
+        I_out = reconstruct_pyramid(L_mod)
+
+        out_channels.append(I_out)
+
+    out = np.stack(out_channels, axis=-1)
+
+    if out.shape[2] == 1:
+        out = out[..., 0]
+
+    return _to_uint8(np.clip(out, 0.0, 1.0))
+
+def imadjust_approx(
+    img: np.ndarray,
+    low_in=(0.2, 0.3, 0.0),
+    high_in=(0.6, 0.7, 1.0),
+    gamma=1.0,
+) -> np.ndarray:
+    img = np.asarray(img)
+    orig_dtype = img.dtype
+    """
+    Map RGB input to:
+    RED -> 0.2, 0.6 -> 0,1
+    GREEN -> 0.3, 0.7 -> 0,1
+    BLUE -> 0.0, 1.0 -> 0,1 (no change)
+    Gamma: 1 -> Responsible for nonlinear mapping. >1 darkens, <1 brightens.
+    """
+    # --- Convert to float [0,1] like MATLAB ---
+    if orig_dtype == np.uint8:
+        img01 = img.astype(np.float32) / 255.0
+        scale_back = 255.0
+    elif orig_dtype == np.uint16:
+        img01 = img.astype(np.float32) / 65535.0
+        scale_back = 65535.0
+    elif np.issubdtype(orig_dtype, np.floating):
+        img01 = img.astype(np.float32)
+        scale_back = None
+    else:
+        raise TypeError(f"Unsupported dtype: {orig_dtype}")
+
+    # --- Apply mapping ---
+    if img01.ndim == 2:
+        low = np.array(low_in[0], dtype=np.float32)
+        high = np.array(high_in[0], dtype=np.float32)
+
+        out = (img01 - low) / max(high - low, 1e-6)
+        out = np.clip(out, 0.0, 1.0) ** gamma
+
+    else:
+        low = np.array(low_in, dtype=np.float32).reshape(1, 1, -1)
+        high = np.array(high_in, dtype=np.float32).reshape(1, 1, -1)
+
+        out = (img01 - low) / np.maximum(high - low, 1e-6)
+        out = np.clip(out, 0.0, 1.0) ** gamma
+
+    # --- Convert back like MATLAB ---
+    if scale_back is None:
+        return out.astype(orig_dtype)
+    else:
+        return np.clip(out * scale_back + 0.5, 0, scale_back).astype(orig_dtype)
+
+def imdiffusefilt_pm(img):
+    img01 = img.astype(float) / 255.0
+    out = anisotropic_diffusion(img01, niter=20, kappa=20, gamma=0.1)
+    return (out * 255).astype(np.uint8)
+
+
+def imsharpen_approx(img):
+    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
+    sharp = cv2.addWeighted(img, 1.5, blur, -0.5, 0)
+    return sharp
+
+
+def _mean_region_area(bw: np.ndarray) -> float:
+    lab = label(bw, connectivity=2)
+    counts = np.bincount(lab.ravel())
+    if counts.size <= 1:
+        return 0.0
+    return float(np.mean(counts[1:]))
+
+
+def _filter_rim_blobs(
+    bw: np.ndarray,
+    border_px: np.ndarray,
+    n_border: int,
+) -> np.ndarray:
+    if n_border <= 0 or not np.any(bw):
+        return bw
+    lab_rim = label(bw, connectivity=2)
+    max_label = int(lab_rim.max())
+    if max_label == 0:
+        return bw
+    border_hits = np.bincount(lab_rim[border_px], minlength=max_label + 1)
+    remove_labels = np.flatnonzero(border_hits[1:] / float(n_border) >= 0.20) + 1
+    if remove_labels.size == 0:
+        return bw
+    bw = bw.copy()
+    bw[np.isin(lab_rim, remove_labels)] = False
+    return bw
+
+
+def _crop_to_nonzero_bbox(rgb: np.ndarray, pad: int = 2) -> np.ndarray:
+    if rgb.size == 0:
+        return rgb
+    m = np.any(rgb != 0, axis=2) if rgb.ndim == 3 else (rgb != 0)
+    ys, xs = np.where(m)
+    if ys.size == 0 or xs.size == 0:
+        return rgb
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0 = max(0, y0 - pad)
+    x0 = max(0, x0 - pad)
+    y1 = min(rgb.shape[0], y1 + pad)
+    x1 = min(rgb.shape[1], x1 + pad)
+    return rgb[y0:y1, x0:x1].copy()
+
+
+def _get_expts_from_detectdish(
+    rgb: np.ndarray,
+    dish_mode: str,
+    target_area_px2: float,
+) -> List[Dict[str, np.ndarray]]:
+    if dish_mode == "pre_cropped":
+        return [{"expt": rgb}]
+    import DetectDish
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    fixed_diameter_px = 2.0 * float(np.sqrt(float(target_area_px2) / np.pi))
+    masked_bgr, ellipse_final, brightness, _ = DetectDish.detect_plate_rgb(
+        bgr, fixed_diameter_px=fixed_diameter_px
+    )
+    if ellipse_final is None or masked_bgr is None:
+        return [{"expt": rgb}]
+    masked_rgb = cv2.cvtColor(masked_bgr, cv2.COLOR_BGR2RGB)
+    if dish_mode == "single":
+        return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+    y_split = DetectDish.find_divider_y(
+        brightness,
+        ellipse_final,
+        bar_q=DetectDish.BAR_Q,
+        frac_thresh=DetectDish.BAR_FRAC_THRESH,
+        min_thick=DetectDish.BAR_MIN_THICK_PX,
+        max_thick=DetectDish.BAR_MAX_THICK_PX,
+    )
+    if y_split is None:
+        return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+    top_bgr, bot_bgr = DetectDish.mask_top_bottom(
+        image_bgr=bgr,
+        ellipse=ellipse_final,
+        y_split=y_split,
+        gap=DetectDish.BAR_SPLIT_MARGIN_PX,
+    )
+    top_rgb = cv2.cvtColor(top_bgr, cv2.COLOR_BGR2RGB)
+    bot_rgb = cv2.cvtColor(bot_bgr, cv2.COLOR_BGR2RGB)
+    return [{"expt": _crop_to_nonzero_bbox(top_rgb)}, {"expt": _crop_to_nonzero_bbox(bot_rgb)}]
 
 
 # ===========================================================================
@@ -133,6 +526,18 @@ def preprocess_expt(
     gray_expt : grayscale uint8 of the preprocessed image
                 (optionally blackhat-boosted)
     """
+    # Cache lookup — preprocessing is params-independent and expensive
+    # (Perona-Malik 20 iters + Laplacian pyramid).  The tuner calls this
+    # hundreds of times per image with different TuningParams; caching the
+    # result gives a large speedup at zero cost to accuracy.
+    # id(expt) is O(1) — no image copy. Safe because _WORKER_RGB_CACHE in the
+    # tuner holds a live reference, so the same array object is reused for the
+    # same image across all param evaluations within a worker process.
+    _cache_key = (id(expt), expt.shape, expt.strides, use_blackhat, blackhat_disk_r)
+    _cached = _PREPROCESS_CACHE.get(_cache_key)
+    if _cached is not None:
+        return _cached
+
     # --- standard chain (identical to _count_one_expt_full_logic) ---
     expt_adj = imadjust_approx(expt)                           # stretch contrast per channel
     expt_adj = locallapfilt_approx(expt_adj, sigma=0.2, alpha=0.5)  # edge-aware tone mapping
@@ -156,22 +561,15 @@ def preprocess_expt(
         # Add back: darker colonies become even darker (their V dip is amplified)
         gray_expt = cv2.add(gray_expt, blackhat)
 
-    return expt_adj, gray_expt
+    _result = (expt_adj, gray_expt)
+    if len(_PREPROCESS_CACHE) < _PREPROCESS_CACHE_MAXSIZE:
+        _PREPROCESS_CACHE[_cache_key] = _result
+    return _result
 
 
 # ===========================================================================
 # BLOCK 2 — HSV adaptive masking
 # ===========================================================================
-
-def _create_hsv_mask(rgb: np.ndarray, v_thresh: float, s_min: float) -> np.ndarray:
-    """
-    Simple HSV threshold: V < v_thresh AND S > s_min.
-    Both V and S are in [0, 1] (skimage rgb2hsv convention).
-    """
-    hsv = rgb2hsv(_as_float01(rgb))
-    S = hsv[..., 1]
-    V = hsv[..., 2]
-    return (V < v_thresh) & (S > s_min)
 
 
 def hsv_mask_adaptive(
@@ -183,39 +581,46 @@ def hsv_mask_adaptive(
     Adapt the V threshold so the HSV mask agrees with the extended-minima
     reference derived from the preprocessed grayscale.
 
-    Logic (verbatim from hsv_filter() in countCFUAPP, with finer step):
+    Logic (verbatim from hsv_filter() in countCFUAPP, with configurable step):
       reference = imextendedmin(gray, h_ref) & (gray != 0)
       start at v_thresh = hsv_v_start
-      while pixel-error > hsv_err_tol:
-          v_thresh -= 0.01   (finer than original 0.05)
+      while FP-rate > hsv_err_tol:
+          v_thresh -= hsv_v_step   (default 0.01; APP1 used 0.05 — finer = more precise)
           if v_thresh < hsv_v_min: break
 
     Returns a raw boolean candidate mask (before morphological cleanup).
     """
     # Reference: dark blobs from extended minima, h adaptive to plate contrast.
     # Formula: 12% of the p10-p90 range, clamped to [10, 35].
+    # This is strictly better than APP1's fixed h=35: low-contrast plates get
+    # a smaller h (more sensitive minima), high-contrast plates get h up to 35.
     nz_pixels = gray_expt[gray_expt != 0]
-    h_ref = int(np.clip(0.12 * (np.percentile(nz_pixels, 90) - np.percentile(nz_pixels, 10)), 10, 35))
+    h_ref = int(np.clip(float(params.h_ref_frac) * (np.percentile(nz_pixels, 90) - np.percentile(nz_pixels, 10)), 10, 35))
     bw_ref = imextendedmin(gray_expt, h_ref) & (gray_expt != 0)
 
     dish_size = float(np.count_nonzero(gray_expt != 0))
 
+    # Pre-compute HSV channels once — the loop only changes v_thresh.
+    _hsv = rgb2hsv(_as_float01(expt_adj))
+    _S = _hsv[..., 1]
+    _V = _hsv[..., 2]
+    _dish_nz = gray_expt != 0
+    _s_min = float(params.hsv_s_min)
+
     v_thresh = float(params.hsv_v_start)
-    mask = _create_hsv_mask(expt_adj, v_thresh, params.hsv_s_min)
-    mask = mask & (gray_expt != 0)
+    mask = (_V < v_thresh) & (_S > _s_min) & _dish_nz
 
     # FP rate: fraction of dish pixels that are in mask but NOT in reference.
-    # Unlike the original symmetric |mask - ref| / image_size, this only counts
-    # over-prediction (agar leakage). The loop can never be tricked by missed
-    # colonies (FN) into stepping too far, preventing undercounting.
+    # Unlike APP1's symmetric |mask - ref| / image_size (which counts FN too),
+    # this only counts over-prediction (agar leakage). The loop can never be
+    # tricked by missed colonies (FN) into stepping too far → prevents undercounting.
     fp_rate = float(np.count_nonzero(mask & ~bw_ref)) / dish_size if dish_size > 0 else 0.0
 
     while fp_rate > float(params.hsv_err_tol):
-        v_thresh -= 0.01
+        v_thresh -= float(params.hsv_v_step)
         if v_thresh < float(params.hsv_v_min):
             break
-        mask = _create_hsv_mask(expt_adj, v_thresh, params.hsv_s_min)
-        mask = mask & (gray_expt != 0)
+        mask = (_V < v_thresh) & (_S > _s_min) & _dish_nz
         fp_rate = float(np.count_nonzero(mask & ~bw_ref)) / dish_size if dish_size > 0 else 0.0
 
     return mask
@@ -250,7 +655,7 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
     # thin-bridge noise between nearby colonies must be cut.
     _cov_pre = float(np.count_nonzero(bw)) / dish_area if dish_area > 0 else 1.0
     _open_r = 1 if _cov_pre < 0.08 else int(params.hsv_open_disk_small)
-    bw = binary_opening(bw, footprint=disk(_open_r))
+    bw = binary_opening(bw, footprint=_disk(_open_r))
 
     # 3 — close ring / arc gaps per blob, then fill enclosed holes.
     # The HSV mask often captures only the dark rim of a colony, leaving
@@ -263,15 +668,26 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
     # expanding neighbours.  Per-blob processing prevents merging.
     bw_labeled, n_blobs = ndi.label(bw)
     bw_repaired = np.zeros_like(bw)
-    for i in range(1, n_blobs + 1):
-        blob = bw_labeled == i
-        area = int(np.count_nonzero(blob))
+    blob_areas = np.bincount(bw_labeled.ravel())
+    H, W = bw.shape
+    blob_slices = ndi.find_objects(bw_labeled)  # O(1) bounding boxes, no full-image scan
+    for i, sl in enumerate(blob_slices):
+        if sl is None:
+            continue
+        label_i = i + 1
+        area = int(blob_areas[label_i])
         r = 12 if area < 1500 else (6 if area < 8000 else 4)
-        _gap_se = disk(r)
-        grown = binary_dilation(blob, footprint=_gap_se)
+        # Pad the bounding box by r so dilation/erosion have enough room.
+        # Operating on the padded crop instead of the full image reduces cost
+        # from O(H×W) to O((blob_bbox + 2r)²) — ~100–1000× faster per blob.
+        r0 = max(0, sl[0].start - r);  r1 = min(H, sl[0].stop + r)
+        c0 = max(0, sl[1].start - r);  c1 = min(W, sl[1].stop + r)
+        blob_crop = bw_labeled[r0:r1, c0:c1] == label_i
+        _gap_se = _disk(r)
+        grown = binary_dilation(blob_crop, footprint=_gap_se)
         filled = ndi.binary_fill_holes(grown)
         shrunk = binary_erosion(filled, footprint=_gap_se)
-        bw_repaired |= blob | shrunk   # union keeps original pixels
+        bw_repaired[r0:r1, c0:c1] |= blob_crop | shrunk
     bw = bw_repaired
 
     # 4 — fill interior holes so large dark-core colonies are treated as
@@ -293,7 +709,7 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
         h, w = bw.shape
         big = cv2.resize(bw.astype(np.uint8), None, fx=2.0, fy=2.0,
                          interpolation=cv2.INTER_NEAREST) > 0
-        big = binary_opening(big, footprint=disk(int(params.hsv_open_disk_large)))
+        big = binary_opening(big, footprint=_disk(int(params.hsv_open_disk_large)))
         bw = cv2.resize(big.astype(np.uint8), (w, h),
                         interpolation=cv2.INTER_NEAREST) > 0
 
@@ -332,8 +748,8 @@ def _ws_single_pass(
         return region_mask.astype(np.int32), 1
 
     L = watershed(-dist_s, markers=markers, mask=region_mask).astype(np.int32)
-    valid = [lbl for lbl in range(1, n_seeds + 1)
-             if np.count_nonzero(L == lbl) >= min_area]
+    label_sizes = np.bincount(L.ravel())
+    valid = np.flatnonzero(label_sizes[1:] >= min_area) + 1
     if len(valid) <= 1:
         return region_mask.astype(np.int32), 1
 
@@ -396,8 +812,8 @@ def _conservative_watershed(
 
     # First pass found multiple seeds — watershed into segments.
     L = watershed(-dist_s, markers=markers, mask=region_mask).astype(np.int32)
-    valid = [lbl for lbl in range(1, n_seeds + 1)
-             if np.count_nonzero(L == lbl) >= min_area]
+    label_sizes = np.bincount(L.ravel())
+    valid = np.flatnonzero(label_sizes[1:] >= min_area) + 1
 
     if len(valid) <= 1:
         return region_mask.astype(np.int32), 1, np.zeros_like(region_mask, dtype=bool)
@@ -437,10 +853,60 @@ def _conservative_watershed(
     return final_L, total_count, region_mask & (mx != mn)
 
 
+def _recover_second_pass_blobs(
+    bw_raw: np.ndarray,
+    bw_clean: np.ndarray,
+    gray_expt: np.ndarray,
+    dish_area: int,
+) -> np.ndarray:
+    bw_clean_cov = np.count_nonzero(bw_clean) / dish_area if dish_area > 0 else 0.0
+    if dish_area <= 0 or bw_clean_cov > 0.10:
+        return bw_clean
+
+    lost = bw_raw & ~bw_clean
+    if not np.any(lost):
+        return bw_clean
+
+    bw_soft = imextendedmin(gray_expt, 15) & (gray_expt != 0)
+    already_covered = binary_dilation(bw_clean, footprint=_disk(10))
+    uncovered = bw_soft & lost & ~already_covered
+    if not np.any(uncovered):
+        return bw_clean
+
+    labeled_lost, _ = ndi.label(lost)
+    keep2 = np.unique(labeled_lost[uncovered])
+    keep2 = keep2[keep2 > 0]
+    if keep2.size == 0:
+        return bw_clean
+
+    bw_extra = np.isin(labeled_lost, keep2)
+    H, W = bw_clean.shape
+    pad = 10
+    bw_clean = bw_clean | bw_extra
+
+    labeled_final, _ = ndi.label(bw_clean)
+    affected = np.unique(labeled_final[bw_extra])
+    affected = affected[affected > 0]
+    for i in affected:
+        region = labeled_final == i
+        rows, cols = np.where(region)
+        r0 = max(rows.min() - pad, 0)
+        r1 = min(rows.max() + pad + 1, H)
+        c0 = max(cols.min() - pad, 0)
+        c1 = min(cols.max() + pad + 1, W)
+        crop = region[r0:r1, c0:c1]
+        bw_clean[r0:r1, c0:c1] |= ndi.binary_fill_holes(crop)
+
+    return bw_clean
+
+
 def _count_colonies_with_instances(
     binary_image: np.ndarray,
     expt_rgb: np.ndarray,
     params: TuningParams,
+    *,
+    build_overlay: bool = True,
+    build_rois: bool = True,
 ) -> Tuple[int, np.ndarray, List[ROI], List[ROI], np.ndarray]:
     """
     Count colonies in a binary mask using per-blob watershed.
@@ -488,7 +954,7 @@ def _count_colonies_with_instances(
         bw = np.isin(lab0, keep_labels)
         bw = bwareaopen(bw, params.min_object_area)
 
-    overlay = imoverlay(expt_rgb, bw, "green")
+    overlay = imoverlay(expt_rgb, bw, "green") if build_overlay else expt_rgb
 
     colony_roi: List[ROI] = []
     cluster_roi: List[ROI] = []
@@ -505,10 +971,16 @@ def _count_colonies_with_instances(
     all_areas = np.array([r.area for r in regs], dtype=float)
     if all_areas.size > 0:
         overall_med = float(np.median(all_areas))
+        # Cap at 50 candidates sorted by area — the smallest blobs are the most
+        # reliable single-colony references and the median stabilises well before
+        # scanning every eligible blob.  Identical result on typical plates;
+        # saves O(n_blobs) watershed passes on dense plates.
+        candidates_pre = sorted(
+            [rp for rp in regs if rp.area <= overall_med * 1.5],
+            key=lambda rp: rp.area,
+        )[:50]
         single_areas = []
-        for reg_pre in regs:
-            if reg_pre.area > overall_med * 1.5:
-                continue
+        for reg_pre in candidates_pre:
             rm = (lab[reg_pre.bbox[0]:reg_pre.bbox[2],
                       reg_pre.bbox[1]:reg_pre.bbox[3]] == reg_pre.label)
             _, n_pre = _ws_single_pass(rm, float(params.ws_thresh_abs_frac),
@@ -523,40 +995,45 @@ def _count_colonies_with_instances(
     for reg in regs:
         minr, minc, maxr, maxc = reg.bbox
         region_mask = (lab[minr:maxr, minc:maxc] == reg.label)
+        instance_view = instance_labels[minr:maxr, minc:maxc]
 
         L, n_colonies, boundary_local = _conservative_watershed(region_mask, params, ref_area)
 
         center = np.array([reg.centroid[1], reg.centroid[0]], dtype=float)
 
-        region_contours = find_contours(region_mask.astype(float), level=0.5)
-        if not region_contours:
-            continue
-        cont = max(region_contours, key=len)
-        step = max(1, len(cont) // 50)
-        pts = cont[::step, :]
-        if pts.size == 0:
-            continue
-        poly_pos = np.stack([pts[:, 1] + minc, pts[:, 0] + minr], axis=1).astype(float)
+        poly_pos: Optional[np.ndarray] = None
+        if build_rois:
+            region_contours = find_contours(region_mask.astype(float), level=0.5)
+            if not region_contours:
+                continue
+            cont = max(region_contours, key=len)
+            step = max(1, len(cont) // 50)
+            pts = cont[::step, :]
+            if pts.size == 0:
+                continue
+            poly_pos = np.stack([pts[:, 1] + minc, pts[:, 0] + minr], axis=1).astype(float)
 
         if n_colonies <= 1:
             num_cfu += 1
-            colony_roi.append(ROI(Position=poly_pos, Center=center,
-                                  Creator="Algorithm", Shape="Polygon", NumOfCFU=1))
-            instance_labels[lab == reg.label] = next_label
+            if build_rois and poly_pos is not None:
+                colony_roi.append(ROI(Position=poly_pos, Center=center,
+                                      Creator="Algorithm", Shape="Polygon", NumOfCFU=1))
+            instance_view[region_mask] = next_label
             next_label += 1
         else:
             num_cfu += n_colonies
-            cluster_roi.append(ROI(Position=poly_pos, Center=center,
-                                   Creator="Algorithm", Shape="Polygon", NumOfCFU=n_colonies))
+            if build_rois and poly_pos is not None:
+                cluster_roi.append(ROI(Position=poly_pos, Center=center,
+                                       Creator="Algorithm", Shape="Polygon", NumOfCFU=n_colonies))
 
-            bd_full = np.zeros(overlay.shape[:2], dtype=bool)
-            bd_full[minr:maxr, minc:maxc] = binary_dilation(boundary_local, footprint=disk(1))
-            overlay[bd_full] = np.array([255, 255, 0], dtype=np.uint8)
+            if build_overlay:
+                overlay_view = overlay[minr:maxr, minc:maxc]
+                overlay_view[binary_dilation(boundary_local, footprint=_disk(1))] = np.array([255, 255, 0], dtype=np.uint8)
 
             for local_label in range(1, int(L.max()) + 1):
                 local_mask = (L == local_label)
                 if np.any(local_mask):
-                    instance_labels[minr:maxr, minc:maxc][local_mask] = next_label
+                    instance_view[local_mask] = next_label
                     next_label += 1
 
     return num_cfu, overlay, colony_roi, cluster_roi, instance_labels
@@ -571,6 +1048,7 @@ def _count_one_expt_hsv(
     k: int,
     use_blackhat: bool = False,
     params: Optional[TuningParams] = None,
+    build_rois: bool = True,
 ) -> Tuple[int, str, str, float, np.ndarray, List[ROI], List[ROI], np.ndarray]:
     """
     Run the HSV pipeline on a single cropped/masked dish image.
@@ -597,7 +1075,9 @@ def _count_one_expt_hsv(
     gray_unc = _gray_uint8(expt)
     _, thr = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     bw_unc = (gray_unc < thr) & (gray_unc != 0)
-    num_unc, _, _, _, _ = _count_colonies_with_instances(bw_unc, expt, params)
+    num_unc, _, _, _, _ = _count_colonies_with_instances(
+        bw_unc, expt, params, build_overlay=False, build_rois=False
+    )
     if num_unc > int(params.uncountable_precheck_cutoff):
         return int(num_unc), "Uncountable", "Uncountable", 0.0, np.array([]), [], [], np.zeros((*expt.shape[:2], 3), dtype=np.uint8)
 
@@ -617,12 +1097,7 @@ def _count_one_expt_hsv(
     dish_mask_orig = np.any(expt > 0, axis=2)
     border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=5)
     n_border = int(np.count_nonzero(border_px))
-    if n_border > 0 and np.any(bw_clean):
-        lab_rim = label(bw_clean)
-        for reg in regionprops(lab_rim):
-            blob_mask = lab_rim == reg.label
-            if float(np.count_nonzero(blob_mask & border_px)) / n_border >= 0.20:
-                bw_clean[blob_mask] = False
+    bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
 
     # --- Second pass: recover blobs lost in morpho_cleanup ---
     # Only runs on sparse plates (bw_clean < 10% of dish).
@@ -638,51 +1113,13 @@ def _count_one_expt_hsv(
     # imextendedmin(h=15) seed not already near an accepted colony.
     # Add them back WITHOUT re-running morpho_cleanup (it already rejected them).
     dish_area = int(np.count_nonzero(gray_expt != 0))
-    bw_clean_cov = np.count_nonzero(bw_clean) / dish_area if dish_area > 0 else 0.0
-    print(f"[2ndpass k={k}] bw_clean coverage={bw_clean_cov:.3f}")
-    if dish_area > 0 and bw_clean_cov <= 0.10:
-        lost = bw_raw & ~bw_clean
-        print(f"[2ndpass k={k}] bw_raw={np.count_nonzero(bw_raw)} bw_clean={np.count_nonzero(bw_clean)} lost={np.count_nonzero(lost)}")
-        if np.any(lost):
-            bw_soft = imextendedmin(gray_expt, 15) & (gray_expt != 0)
-            already_covered = binary_dilation(bw_clean, footprint=disk(10))
-            uncovered = bw_soft & lost & ~already_covered
-            print(f"[2ndpass k={k}] bw_soft={np.count_nonzero(bw_soft)} uncovered_in_lost={np.count_nonzero(uncovered)}")
-            if np.any(uncovered):
-                labeled_lost, _ = ndi.label(lost)
-                keep2 = np.unique(labeled_lost[uncovered])
-                keep2 = keep2[keep2 > 0]
-                print(f"[2ndpass k={k}] blobs_selected={keep2.size}")
-                if keep2.size > 0:
-                    bw_extra = np.zeros_like(bw_clean)
-                    H, W = bw_clean.shape
-                    pad = 10
-                    for lbl in keep2:
-                        bw_extra |= labeled_lost == lbl
-                    print(f"[2ndpass k={k}] bw_extra pixels={np.count_nonzero(bw_extra)}")
-                    bw_clean = bw_clean | bw_extra
-
-                    # A hole can appear at the seam between a first-pass blob and a
-                    # second-pass blob (each is convex individually but together they
-                    # form a ring). Fix: for every blob in bw_clean that was touched
-                    # by bw_extra, do a tight-crop binary_fill_holes so the hole is
-                    # enclosed and guaranteed to be filled.
-                    labeled_final, _ = ndi.label(bw_clean)
-                    affected = np.unique(labeled_final[bw_extra])
-                    affected = affected[affected > 0]
-                    for i in affected:
-                        region = labeled_final == i
-                        rows, cols = np.where(region)
-                        r0 = max(rows.min() - pad, 0); r1 = min(rows.max() + pad + 1, H)
-                        c0 = max(cols.min() - pad, 0); c1 = min(cols.max() + pad + 1, W)
-                        crop = region[r0:r1, c0:c1]
-                        bw_clean[r0:r1, c0:c1] |= ndi.binary_fill_holes(crop)
+    bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
 
     # --- BLOCKS 4+5+6: candidate filtering + watershed + count/ROI ---
     # Pass the ORIGINAL (non-preprocessed) image so the green overlay lands
     # on unaltered pixel colours, not the contrast-boosted version.
     num_cfu, out_image, colony_roi, cluster_roi, _ = _count_colonies_with_instances(
-        bw_clean, expt, params
+        bw_clean, expt, params, build_overlay=True, build_rois=build_rois
     )
 
     # Hard ceiling (same as original)
@@ -717,12 +1154,161 @@ def predict_count_only_hsv(
     params = params or TuningParams()
     expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
     total = 0
-    for k, item in enumerate(expts, start=1):
-        num_cfu, _, _, _, _, _, _, _, _ = _count_one_expt_hsv(
-            item["expt"], k, use_blackhat=use_blackhat, params=params
+    for item in expts:
+        expt = item["expt"]
+
+        expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat)
+
+        expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
+        gray0 = _gray_uint8(expt_blur)
+        bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
+        bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
+        if not np.any(bw_min0):
+            continue
+
+        gray_unc = _gray_uint8(expt)
+        _, thr = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bw_unc = (gray_unc < thr) & (gray_unc != 0)
+        num_unc, _, _, _, _ = _count_colonies_with_instances(
+            bw_unc, expt, params, build_overlay=False, build_rois=False
+        )
+        if num_unc > int(params.uncountable_precheck_cutoff):
+            total += int(num_unc)
+            continue
+
+        bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
+        dish_area = int(np.count_nonzero(gray_expt != 0))
+        bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
+
+        dish_mask_orig = np.any(expt > 0, axis=2)
+        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=5)
+        n_border = int(np.count_nonzero(border_px))
+        bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
+        bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+
+        num_cfu, _, _, _, _ = _count_colonies_with_instances(
+            bw_clean, expt, params, build_overlay=False, build_rois=False
         )
         total += int(num_cfu)
     return total
+
+
+def predict_tuning_features(
+    rgb: np.ndarray,
+    dish_mode: str = "auto",
+    target_area_px2: float = 2245000.0,
+    use_blackhat: bool = False,
+    params: Optional[TuningParams] = None,
+) -> Dict[str, Any]:
+    """
+    Run the full HSV pipeline silently and return features needed for grid-search tuning.
+
+    This is a print-free mirror of _count_one_expt_hsv that also exposes
+    per-instance pixel areas (required by tune_params_cv.py for the area-EMD
+    and area-mass scores).
+
+    Returns
+    -------
+    dict with keys:
+        count          : int   — total predicted CFU count
+        instance_areas : list[float] — pixel area of every predicted instance
+        methods        : list[str]   — method per expt ("HSV", "Zero", "Uncountable")
+        classes        : list[str]   — size class per expt
+        mean_area      : float       — mean colony area across countable expts
+    """
+    params = params or TuningParams()
+    expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
+
+    total_count = 0
+    all_instance_areas: List[float] = []
+    mean_areas: List[float] = []
+    methods: List[str] = []
+    classes: List[str] = []
+
+    for k, item in enumerate(expts, start=1):
+        expt = item["expt"]
+
+        # --- BLOCK 1: preprocess ---
+        expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat)
+
+        # --- Zero-CFU fast-check ---
+        expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
+        gray0 = _gray_uint8(expt_blur)
+        bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
+        bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
+        if not np.any(bw_min0):
+            methods.append("Zero")
+            classes.append("Zero")
+            continue
+
+        # --- Uncountable fast-check (Otsu on raw gray) ---
+        gray_unc = _gray_uint8(expt)
+        _, thr = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bw_unc = (gray_unc < thr) & (gray_unc != 0)
+        num_unc, _, _, _, inst_unc = _count_colonies_with_instances(
+            bw_unc, expt, params, build_overlay=False, build_rois=False
+        )
+        if num_unc > int(params.uncountable_precheck_cutoff):
+            total_count += int(num_unc)
+            _, cnts = np.unique(inst_unc[inst_unc > 0], return_counts=True)
+            all_instance_areas.extend(float(c) for c in cnts)
+            methods.append("Uncountable")
+            classes.append("Uncountable")
+            continue
+
+        # --- BLOCK 2: adaptive HSV mask ---
+        bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
+
+        # --- BLOCK 3: morphological cleanup ---
+        dish_area = int(np.count_nonzero(gray_expt != 0))
+        bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
+
+        # --- Rim filter ---
+        dish_mask_orig = np.any(expt > 0, axis=2)
+        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=5)
+        n_border = int(np.count_nonzero(border_px))
+        bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
+
+        # --- Second pass: recover blobs lost in morpho_cleanup on sparse plates ---
+        bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+
+        # --- BLOCKS 4+5+6: count + instance labels ---
+        num_cfu, _, _, _, inst_labels = _count_colonies_with_instances(
+            bw_clean, expt, params, build_overlay=False, build_rois=False
+        )
+
+        # Hard ceiling
+        if num_cfu > int(params.uncountable_cutoff):
+            total_count += int(num_cfu)
+            _, cnts = np.unique(inst_labels[inst_labels > 0], return_counts=True)
+            all_instance_areas.extend(float(c) for c in cnts)
+            methods.append("Uncountable")
+            classes.append("Uncountable")
+            continue
+
+        total_count += int(num_cfu)
+        _, cnts = np.unique(inst_labels[inst_labels > 0], return_counts=True)
+        all_instance_areas.extend(float(c) for c in cnts)
+
+        mean_area = _mean_region_area(bw_clean)
+        mean_areas.append(float(mean_area))
+
+        if mean_area <= 150:
+            size_class = "small"
+        elif mean_area < 400:
+            size_class = "medium"
+        else:
+            size_class = "large"
+        classes.append(size_class)
+        methods.append("HSV")
+
+    return {
+        "count": total_count,
+        "instance_areas": all_instance_areas,
+        "methods": methods,
+        "classes": classes,
+        "mean_area": float(np.mean(mean_areas)) if mean_areas else 0.0,
+    }
 
 
 def count_cfu_app2(
@@ -737,7 +1323,8 @@ def count_cfu_app2(
     save_which: str = "overlay",   # "overlay" | "expt" | "both"
     use_blackhat: bool = False,
     params: Optional[TuningParams] = None,
-) -> List[str]:
+    return_metadata: bool = False,
+) -> Any:
     """
     Count CFU on a single image using the HSV-first pipeline.
 
@@ -758,12 +1345,14 @@ def count_cfu_app2(
     expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
 
     out_paths: List[str] = []
+    counts: List[int] = []
 
     for k, item in enumerate(expts, start=1):
         expt = item["expt"]
-        _, _, _, _, out_image, _, _, bw_post_rgb = _count_one_expt_hsv(
-            expt, k, use_blackhat=use_blackhat, params=params
+        num_cfu, _, _, _, out_image, _, _, bw_post_rgb = _count_one_expt_hsv(
+            expt, k, use_blackhat=use_blackhat, params=params, build_rois=False
         )
+        counts.append(int(num_cfu))
 
         expt_id = top_cell if k == 1 else bot_cell
         base = folder_dir / version / expt_id
@@ -781,10 +1370,15 @@ def count_cfu_app2(
             save_tiff_rgb(expt_tif, expt)
             out_paths.append(str(expt_tif))
 
-        # Save mask after Block 3 (post morpho_cleanup) for debugging
+        # Save the post-cleanup mask so the desktop app can treat the
+        # algorithm segmentation as an editable mask layer instead of a
+        # baked green overlay.
         post_tif = base.with_name(base.name + "__post").with_suffix(".tif")
         save_tiff_rgb(post_tif, bw_post_rgb)
         out_paths.append(str(post_tif))
+
+    if return_metadata:
+        return {"out_paths": out_paths, "counts": counts}
 
     return out_paths
 

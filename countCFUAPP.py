@@ -1438,14 +1438,23 @@ def count_cfu_app(
 # ----------------------------
 # CLI
 # ----------------------------
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+def _collect_images(path: Path) -> List[Path]:
+    """Return a list of image files from a file path OR a directory."""
+    if path.is_dir():
+        return sorted(p for p in path.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
+    return [path]
+
 if __name__ == "__main__":
     import argparse
     import cv2
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Run CFU counter on a single image")
-    parser.add_argument("image", help="Input image (png/jpg/tif)")
-    parser.add_argument("outdir", help="Output directory")
+    parser.add_argument("--image", help="Input image (png/jpg/tif)")
+    parser.add_argument("--outdir", help="Output directory")
     parser.add_argument("--version", default="v1")
     # Petri dish handling (via DetectDish.py)
     parser.add_argument("--dish_mode", default="auto", choices=["auto", "single", "double", "pre_cropped"],
@@ -1457,25 +1466,32 @@ if __name__ == "__main__":
                         help="Save overlay TIFF, cropped dish TIFF, or both")
     args = parser.parse_args()
 
-    img_bgr = cv2.imread(args.image, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise RuntimeError(f"Cannot read {args.image}")
-    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    input_path = Path(args.image)
+    image_files = _collect_images(input_path)
+    if not image_files:
+        raise RuntimeError(f"No images found at: {input_path}")
 
-    stem = Path(args.image).stem
-    out_paths = count_cfu_app(
-        rgb=img,
-        top_cell=stem,               # if split -> top uses stem, bottom uses stem + "_Bottom"
-        bot_cell=stem + "_Bottom",
-        folder_dir=args.outdir,
-        version=args.version,
-        index=Path(args.image).name,
-        dish_mode=args.dish_mode,
-        target_area_px2=args.target_area_px2,
-        save_which=args.save_which,
-        params=None
-    )
+    for img_path in image_files:
+        img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            print(f"[skip] Cannot read {img_path}")
+            continue
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    print("Saved:")
+        stem = img_path.stem
+        out_paths = count_cfu_app(
+            rgb=img,
+            top_cell=stem,               # if split -> top uses stem, bottom uses stem + "_Bottom"
+            bot_cell=stem + "_Bottom",
+            folder_dir=args.outdir,
+            version=args.version,
+            index=Path(args.image).name,
+            dish_mode=args.dish_mode,
+            target_area_px2=args.target_area_px2,
+            save_which=args.save_which,
+            params=None
+        )
     for p in out_paths:
         print(p)
+
+

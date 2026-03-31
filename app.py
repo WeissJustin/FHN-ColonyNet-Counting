@@ -45,7 +45,7 @@ import numpy as np
 import cv2
 from dataclasses import dataclass, field
 import copy
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QRect, QPoint, QTimer, QModelIndex
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QRect, QRectF, QPoint, QTimer, QModelIndex
 from PySide6.QtGui import QPixmap, QImage, QFont, QPalette, QColor, QCursor, QPen, QIcon, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
     QDialog, QPlainTextEdit
 )
 from PySide6.QtWidgets import QSlider
-from countCFUAPP import count_cfu_app
+from countCFUAPP2 import count_cfu_app2
 from PySide6.QtWidgets import QCheckBox
 
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
@@ -628,6 +628,19 @@ def cv_read_rgb_anydepth(path: str) -> np.ndarray:
     raise ValueError(f"Unsupported image shape: {img.shape} for {path}")
 
 
+def cv_read_mask_anydepth(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Failed to read mask image: {path}")
+    if img.ndim == 3:
+        img = img[..., 0]
+    if img.dtype == np.uint16:
+        img = (img / 256).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return img
+
+
 def safe_mkdir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -653,6 +666,26 @@ def stitch_side_by_side(left: np.ndarray, right: np.ndarray, gap: int = 12) -> n
     left, right = _pad_to_same_height(left, right)
     H = left.shape[0]
     spacer = np.zeros((H, gap, 3), dtype=np.uint8)
+    return np.concatenate([left, spacer, right], axis=1)
+
+
+def stitch_mask_side_by_side(left: np.ndarray, right: np.ndarray, gap: int = 12) -> np.ndarray:
+    left = (left > 0).astype(np.uint8) * 255
+    right = (right > 0).astype(np.uint8) * 255
+    ha, wa = left.shape[:2]
+    hb, wb = right.shape[:2]
+    H = max(ha, hb)
+
+    def pad_mask(img: np.ndarray, H: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h == H:
+            return img
+        pad_h = H - h
+        return np.pad(img, ((0, pad_h), (0, 0)), mode="constant", constant_values=0)
+
+    left = pad_mask(left, H)
+    right = pad_mask(right, H)
+    spacer = np.zeros((H, gap), dtype=np.uint8)
     return np.concatenate([left, spacer, right], axis=1)
 
 
@@ -1003,6 +1036,7 @@ class PostprocessState:
     paint_mask_pink: Optional[np.ndarray] = None
     paint_mask_red: Optional[np.ndarray] = None
     paint_mask_green: Optional[np.ndarray] = None
+    paint_mask_yellow: Optional[np.ndarray] = None
     paint_mask_black: Optional[np.ndarray] = None
     labels: List[AnnotationLabel] = field(default_factory=list)
     next_label: int = 1
@@ -1020,6 +1054,8 @@ class PostprocessState:
             self.paint_mask_red = np.zeros((h, w), dtype=np.uint8)
         if self.paint_mask_green is None or self.paint_mask_green.shape != (h, w) or self.paint_mask_green.dtype != np.uint8:
             self.paint_mask_green = np.zeros((h, w), dtype=np.uint8)
+        if self.paint_mask_yellow is None or self.paint_mask_yellow.shape != (h, w) or self.paint_mask_yellow.dtype != np.uint8:
+            self.paint_mask_yellow = np.zeros((h, w), dtype=np.uint8)
         if self.paint_mask_black is None or self.paint_mask_black.shape != (h, w) or self.paint_mask_black.dtype != np.uint8:
             self.paint_mask_black = np.zeros((h, w), dtype=np.uint8)
 
@@ -1030,6 +1066,7 @@ class PostprocessState:
             None if self.paint_mask_pink is None else self.paint_mask_pink.copy(),
             None if self.paint_mask_red is None else self.paint_mask_red.copy(),
             None if self.paint_mask_green is None else self.paint_mask_green.copy(),
+            None if self.paint_mask_yellow is None else self.paint_mask_yellow.copy(),
             None if self.paint_mask_black is None else self.paint_mask_black.copy(),
             [(lab.n, lab.x, lab.y) for lab in self.labels],
             int(self.next_label),
@@ -1042,11 +1079,12 @@ class PostprocessState:
         """Restore previous snapshot. Returns True if something was undone."""
         if not self.history:
             return False
-        blue, pink, red, green, black, labs, next_label = self.history.pop()
+        blue, pink, red, green, yellow, black, labs, next_label = self.history.pop()
         self.paint_mask_blue = blue
         self.paint_mask_pink = pink
         self.paint_mask_red = red
         self.paint_mask_green = green
+        self.paint_mask_yellow = yellow
         self.paint_mask_black = black
         self.labels = [AnnotationLabel(n, x, y) for (n, x, y) in labs]
         self.next_label = int(next_label)
@@ -1086,10 +1124,17 @@ class CheckBoxHeader(QWidget):
 class ResultRow:
     source_image: str
     tif_paths: List[str]
+    expt_paths: List[str] = field(default_factory=list)
+    post_mask_paths: List[str] = field(default_factory=list)
+    algorithm_counts: List[int] = field(default_factory=list)
     prefer_annotated: bool = False
 
     _orig_cache: Optional[np.ndarray] = None
     _masked_cache: Optional[np.ndarray] = None
+    _algo_mask_cache: Optional[np.ndarray] = None
+    masked_green_initialized: bool = False
+    user_modified_mask: bool = False
+    current_count: Optional[int] = None
 
     pp_original: PostprocessState = field(default_factory=PostprocessState)
     pp_masked: PostprocessState = field(default_factory=PostprocessState)
@@ -1126,7 +1171,7 @@ class ProcessImagesTask(QRunnable):
                 rgb = cv_read_rgb(img_path)
                 top_id, bot_id = make_output_ids_for_image(img_path)
 
-                tif_paths = count_cfu_app(
+                result_meta = count_cfu_app2(
                     rgb=rgb,
                     top_cell=top_id,
                     bot_cell=bot_id,
@@ -1134,14 +1179,25 @@ class ProcessImagesTask(QRunnable):
                     version=VERSION_FOLDER,
                     index=Path(img_path).name,
                     dish_mode=dish_mode,
+                    save_which="both",
+                    use_blackhat=True,
+                    return_metadata=True,
                 )
 
-                tif_paths = list(tif_paths)
+                tif_paths = list(result_meta.get("out_paths", [])) if isinstance(result_meta, dict) else []
+                algorithm_counts = [int(v) for v in result_meta.get("counts", [])] if isinstance(result_meta, dict) else []
                 tif_paths.sort(key=lambda p: (("_Bottom" in Path(p).stem), Path(p).name.lower()))
+
+                expt_paths = [p for p in tif_paths if "__expt" in Path(p).stem.lower()]
+                post_mask_paths = [p for p in tif_paths if "__post" in Path(p).stem.lower()]
+                overlay_paths = [p for p in tif_paths if "__expt" not in Path(p).stem.lower() and "__post" not in Path(p).stem.lower()]
 
                 rr = ResultRow(
                     source_image=img_path,
-                    tif_paths=tif_paths,
+                    tif_paths=overlay_paths,
+                    expt_paths=expt_paths,
+                    post_mask_paths=post_mask_paths,
+                    algorithm_counts=algorithm_counts,
                 )
                 rows.append(rr)
 
@@ -1564,6 +1620,9 @@ class MainWindow(QMainWindow):
         self.btn_clear_annotations = QPushButton("Clear Annotations")
         self.btn_clear_annotations.setProperty("danger", True)
 
+        self.btn_update_count = QPushButton("Update Count")
+        self.btn_update_count.setProperty("primary", True)
+
         self.btn_save = QPushButton("Save")
         self.btn_save.setProperty("primary", True)
 
@@ -1597,7 +1656,7 @@ class MainWindow(QMainWindow):
         for b in (self.btn_tool_paint, self.btn_tool_select, self.btn_tool_remove,
                 self.btn_pick_folder, self.btn_pick_files, self.btn_pick_out,
                 self.btn_process_old, self.btn_process_cpsam, self.btn_web_ui_help,
-                self.btn_clear_annotations, self.btn_save, self.btn_run_ssh, self.btn_theme_toggle):
+                self.btn_clear_annotations, self.btn_update_count, self.btn_save, self.btn_run_ssh, self.btn_theme_toggle):
             b.setFocusPolicy(Qt.NoFocus)
 
         self.preview_mode_original.setFocusPolicy(Qt.NoFocus)
@@ -1639,6 +1698,7 @@ class MainWindow(QMainWindow):
         self.btn_tool_remove.toggled.connect(lambda on: self._set_tool("remove" if on else None))
         self._last_paint_xy: Optional[Tuple[int, int]] = None
         self.btn_clear_annotations.clicked.connect(self.on_clear_annotations)
+        self.btn_update_count.clicked.connect(self.on_update_count)
         self.btn_save.clicked.connect(self.on_save)
         # Undo shortcut (Cmd+Z on mac, Ctrl+Z elsewhere)
         self.undo_sc = QShortcut(QKeySequence.Undo, self)
@@ -1647,36 +1707,40 @@ class MainWindow(QMainWindow):
         self._last_drag_xy: Optional[Tuple[int, int]] = None
         self._apply_theme_visuals()
 
-    def _load_gt_counts_csv(self):
-        csv_path = Path(__file__).resolve().parent / "CSV Counts.csv"
+    def _load_gt_counts_csv(self, folder: Optional[Path] = None):
         self.gt_counts_index = {}
         self.gt_counts_rows = []
-        if not csv_path.exists():
-            if hasattr(self, "status_lbl"):
-                self.status_lbl.setText("CSV Counts.csv not found (GT overlay disabled).")
+        if folder is None:
             return
+        csv_files = sorted(folder.glob("*.csv"))
+        if not csv_files:
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("No CSV found in images folder (GT overlay disabled).")
+            return
+        csv_path = csv_files[0]
         try:
             with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    file_name = self._normalize_file_key(row.get("file_name") or "")
-                    label = (row.get("label") or "").strip().upper()
-                    dilu_txt = (row.get("dilu") or "").strip()
-                    count_txt = (row.get("count") or "").strip()
-                    if not file_name or not label or not dilu_txt or not count_txt:
+                    row_ci = {k.lower().strip(): v for k, v in row.items()}
+                    label = (row_ci.get("label") or "").strip().upper()
+                    dilu_txt = (row_ci.get("dilu") or "").strip()
+                    count_txt = (row_ci.get("count") or "").strip()
+                    x_suffix = (row_ci.get("x_suffix") or "").strip().lower()
+                    if not label or not dilu_txt or not count_txt:
                         continue
                     try:
                         dilu = int(dilu_txt)
                         count = int(float(count_txt))
                     except ValueError:
                         continue
-                    self.gt_counts_index[(file_name, label, dilu)] = count
-                    self.gt_counts_rows.append((file_name, label, dilu, count))
+                    self.gt_counts_index[(label, dilu, x_suffix)] = count
+                    self.gt_counts_rows.append((label, dilu, x_suffix, count))
         except Exception:
             self.gt_counts_index = {}
             self.gt_counts_rows = []
             if hasattr(self, "status_lbl"):
-                self.status_lbl.setText("Failed to read CSV Counts.csv (GT overlay disabled).")
+                self.status_lbl.setText(f"Failed to read {csv_path.name} (GT overlay disabled).")
 
     def _normalize_file_key(self, file_name: str) -> str:
         # Normalize names like "..._output.png" to the core sample id.
@@ -1685,59 +1749,77 @@ class MainWindow(QMainWindow):
             stem = stem[:-7]
         return stem
 
-    def _lookup_gt_count(self, file_key: str, label: str, dilu: int) -> Optional[int]:
-        # 1) exact match first (works when source filename equals CSV file_name stem)
-        exact = self.gt_counts_index.get((file_key, label, dilu))
+    def _lookup_gt_count(self, label: str, dilu: int, x_suffix: str = "") -> Optional[int]:
+        label = label.upper()
+        x_suffix = x_suffix.strip().lower()
+        # 1) exact match with x_suffix
+        exact = self.gt_counts_index.get((label, dilu, x_suffix))
         if exact is not None:
             return exact
+        # 2) fallback: try without x_suffix
+        if x_suffix:
+            fallback = self.gt_counts_index.get((label, dilu, ""))
+            if fallback is not None:
+                return fallback
+        return None
 
-        # 2) fallback for derived names (e.g., 700Ndilu2_output.png):
-        #    still require label+dilu, then match token presence in CSV file_name.
-        token_compact = f"{label.lower()}dilu{dilu}"
-        token_sep = f"{label.lower()}_dilu{dilu}"
-
-        matches: List[int] = []
-        for csv_file_key, csv_label, csv_dilu, csv_count in self.gt_counts_rows:
-            if csv_label != label or csv_dilu != dilu:
-                continue
-            if token_compact in csv_file_key or token_sep in csv_file_key:
-                matches.append(csv_count)
-
-        if not matches:
-            return None
-        return matches[0]
-
-    def _parse_label_dilu_tokens(self, source_image: str) -> List[Tuple[str, int]]:
+    def _parse_label_dilu_tokens(self, source_image: str) -> List[Tuple[str, int, str]]:
+        """Return list of (label, dilu, x_suffix) parsed from the filename stem."""
         stem = Path(source_image).stem
-        tokens: List[Tuple[str, int]] = []
-        for part in stem.split("_"):
+        parts = stem.split("_")
+        tokens: List[Tuple[str, int, str]] = []
+        for i, part in enumerate(parts):
             m = GT_TOKEN_RE.match(part.strip())
             if not m:
                 continue
             label = m.group(1).upper()
             dilu = int(m.group(2))
-            tokens.append((label, dilu))
+            x_suffix = parts[i + 1].strip().lower() if i + 1 < len(parts) else ""
+            tokens.append((label, dilu, x_suffix))
         return tokens
 
-    def _get_gt_overlays_for_row(self, row: ResultRow) -> List[Tuple[str, str]]:
-        file_key = self._normalize_file_key(Path(row.source_image).name)
+    def _get_count_overlays_for_row(self, row: ResultRow, current_count: Optional[int] = None) -> List[Dict[str, Optional[str]]]:
         tokens = self._parse_label_dilu_tokens(row.source_image)
-        if not tokens:
-            return []
+        algo_counts = list(row.algorithm_counts or [])
 
-        # If there are two output TIFFs, show two GT counts (left/right), else one.
-        if len(row.tif_paths) >= 2 and len(tokens) >= 2:
-            tokens = tokens[:2]
-            positions = ["left", "right"]
+        n_overlays = max(len(tokens), len(algo_counts), 1 if (tokens or algo_counts) else 0)
+        if len(row.tif_paths) >= 2 or len(tokens) >= 2 or len(algo_counts) >= 2:
+            positions = ["left"] * max(2, n_overlays)
         else:
-            tokens = tokens[:1]
             positions = ["left"]
 
-        overlays: List[Tuple[str, str]] = []
-        for (label, dilu), pos in zip(tokens, positions):
-            count = self._lookup_gt_count(file_key, label, dilu)
-            shown = str(count) if count is not None else "N/A"
-            overlays.append((f"GT {label} dilu{dilu}: {shown}", pos))
+        overlays: List[Dict[str, Optional[str]]] = []
+        for idx, pos in enumerate(positions):
+            token = tokens[idx] if idx < len(tokens) else None
+            algo_count = algo_counts[idx] if idx < len(algo_counts) else None
+
+            gt_text: Optional[str] = None
+            diff_text: Optional[str] = None
+            if token is not None:
+                label, dilu, x_suffix = token
+                gt_count = self._lookup_gt_count(label, dilu, x_suffix)
+                shown = str(gt_count) if gt_count is not None else "N/A"
+                gt_text = f"GT {label} dilu{dilu}: {shown}"
+                if gt_count is not None and algo_count is not None:
+                    diff_text = f"Diff: {algo_count - gt_count:+d}"
+
+            algo_text = f"Algorithm: {algo_count}" if algo_count is not None else None
+
+            # current_count goes on the first overlay block only
+            count_text: Optional[str] = None
+            if idx == 0 and current_count is not None:
+                count_text = f"Count: {current_count}"
+
+            if gt_text is not None or algo_text is not None or diff_text is not None or count_text is not None:
+                overlays.append(
+                    {
+                        "position": pos,
+                        "gt_text": gt_text,
+                        "algo_text": algo_text,
+                        "diff_text": diff_text,
+                        "count_text": count_text,
+                    }
+                )
         return overlays
 
     # ---------- Look & feel ----------
@@ -1993,6 +2075,7 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(10)
         layout.addWidget(self.btn_clear_annotations)
+        layout.addWidget(self.btn_update_count)
         layout.addWidget(self.btn_save)
 
         layout.addStretch(1)
@@ -2254,8 +2337,10 @@ class MainWindow(QMainWindow):
         self.selected_images = paths
         if not paths:
             self.lbl_selected.setText("No images selected.")
+            self._load_gt_counts_csv(None)
         else:
             self.lbl_selected.setText(f"{len(paths)} image(s) selected.\nFirst: {Path(paths[0]).name}")
+            self._load_gt_counts_csv(Path(paths[0]).parent)
 
         # NEW: create placeholder ResultRow objects immediately
         self.results = [
@@ -2321,6 +2406,9 @@ class MainWindow(QMainWindow):
 
         self.status_lbl.setText(f"Processed {done}/{total}: {Path(rr.source_image).name}")
         self._force_table_dark()
+        current = self._current_row()
+        if current is not None and current.source_image == rr.source_image:
+            self.on_table_select()
 
     def _update_table_row(self, row_i: int, r: ResultRow):
         if row_i < 0 or row_i >= self.table.rowCount():
@@ -2496,7 +2584,7 @@ class MainWindow(QMainWindow):
         if row._masked_cache is None:
             if row.tif_paths:
                 annotated = [p for p in row.tif_paths if "_annotated" in Path(p).stem.lower()]
-                base = [p for p in row.tif_paths if "_annotated" not in Path(p).stem.lower()]
+                base = [p for p in row.expt_paths if "_annotated" not in Path(p).stem.lower()]
                 if row.prefer_annotated and annotated:
                     newest = max(annotated, key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0.0)
                     row._masked_cache = cv_read_rgb_anydepth(newest)
@@ -2509,16 +2597,94 @@ class MainWindow(QMainWindow):
                 elif annotated:
                     newest = max(annotated, key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0.0)
                     row._masked_cache = cv_read_rgb_anydepth(newest)
+                elif row.tif_paths:
+                    # Fallback for older rows that only have overlay outputs.
+                    base = [p for p in row.tif_paths if "_annotated" not in Path(p).stem.lower()]
+                    if len(base) >= 2:
+                        a = cv_read_rgb_anydepth(base[0])
+                        b = cv_read_rgb_anydepth(base[1])
+                        row._masked_cache = stitch_side_by_side(a, b, gap=12)
+                    elif len(base) >= 1:
+                        row._masked_cache = cv_read_rgb_anydepth(base[0])
             else:
                 row._masked_cache = row._orig_cache.copy()
 
+        if row._masked_cache is None:
+            row._masked_cache = row._orig_cache.copy()
+
         return row._orig_cache, row._masked_cache
+
+    def _get_algorithm_mask(self, row: ResultRow) -> Optional[np.ndarray]:
+        if row._algo_mask_cache is not None:
+            return row._algo_mask_cache
+
+        if not row.post_mask_paths:
+            return None
+
+        try:
+            if len(row.post_mask_paths) >= 2:
+                a = cv_read_mask_anydepth(row.post_mask_paths[0])
+                b = cv_read_mask_anydepth(row.post_mask_paths[1])
+                row._algo_mask_cache = stitch_mask_side_by_side(a, b, gap=12)
+            else:
+                row._algo_mask_cache = (cv_read_mask_anydepth(row.post_mask_paths[0]) > 0).astype(np.uint8) * 255
+        except Exception:
+            row._algo_mask_cache = None
+
+        return row._algo_mask_cache
+
+    def _get_yellow_boundary_mask(self, row: ResultRow, h: int, w: int) -> Optional[np.ndarray]:
+        cached = getattr(row, "_yellow_boundary_cache", None)
+        if cached is not None and cached.shape == (h, w):
+            return cached
+        if not row.tif_paths:
+            return None
+
+        try:
+            parts: List[np.ndarray] = []
+            for p in row.tif_paths:
+                rgb = cv_read_rgb_anydepth(p)
+                mask = (
+                    (rgb[:, :, 0] >= 220)
+                    & (rgb[:, :, 1] >= 220)
+                    & (rgb[:, :, 2] <= 140)
+                )
+                part = (mask.astype(np.uint8) * 255)
+                parts.append(part)
+
+            if not parts:
+                return None
+            if len(parts) >= 2:
+                overlay = stitch_mask_side_by_side(parts[0], parts[1], gap=12)
+            else:
+                overlay = parts[0]
+            if overlay.shape != (h, w):
+                overlay = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_NEAREST)
+            row._yellow_boundary_cache = overlay
+        except Exception:
+            row._yellow_boundary_cache = None
+
+        return row._yellow_boundary_cache
+
+    def _ensure_masked_seed(self, row: ResultRow, h: int, w: int):
+        pp = row.pp_masked
+        pp.ensure_shape(h, w)
+        if row.masked_green_initialized:
+            return
+
+        algo_mask = self._get_algorithm_mask(row)
+        if algo_mask is not None and algo_mask.shape == (h, w):
+            pp.paint_mask_green = algo_mask.copy().astype(np.uint8)
+        yellow_mask = self._get_yellow_boundary_mask(row, h, w)
+        if yellow_mask is not None and yellow_mask.shape == (h, w):
+            pp.paint_mask_yellow = yellow_mask.copy().astype(np.uint8)
+        row.masked_green_initialized = True
 
     def _compose_with_annotations(
         self,
         base: np.ndarray,
         pp: PostprocessState,
-        gt_overlays: Optional[List[Tuple[str, str]]] = None,
+        count_overlays: Optional[List[Dict[str, Optional[str]]]] = None,
     ) -> np.ndarray:
         out = base.copy().astype(np.uint8)
         h, w = out.shape[:2]
@@ -2542,6 +2708,10 @@ class MainWindow(QMainWindow):
             m = pp.paint_mask_green > 0
             if np.any(m):
                 out[m] = np.array([0, 255, 0], dtype=np.uint8)  # green (RGB)
+        if pp.paint_mask_yellow is not None:
+            m = pp.paint_mask_yellow > 0
+            if np.any(m):
+                out[m] = np.array([255, 255, 0], dtype=np.uint8)  # yellow (RGB)
         if pp.paint_mask_black is not None:
             m = pp.paint_mask_black > 0
             if np.any(m):
@@ -2550,33 +2720,108 @@ class MainWindow(QMainWindow):
         # 4) larger selection counts (numbers)
         for lab in pp.labels:
             x, y, n = int(lab.x), int(lab.y), int(lab.n)
-            cv2.circle(out, (x, y), 7, (255, 255, 0), -1)
+            cv2.circle(out, (x, y), 12, (255, 255, 0), -1)
             cv2.putText(
                 out,
                 str(n),
-                (x + 14, y - 14),
+                (x + 20, y - 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
+                2.1,
                 (255, 255, 0),
-                3,
+                6,
                 cv2.LINE_AA,
             )
 
-        # GT overlays (yellow) at top-left / top-right.
-        if gt_overlays:
+        # GT / algorithm / diff overlays stacked at top-left.
+        if count_overlays:
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.95
-            thickness = 2
-            margin = 14
-            y = 44
-            for text, pos in gt_overlays:
-                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
-                x = margin if pos == "left" else max(margin, w - tw - margin)
-                # black stroke for readability on bright backgrounds
-                cv2.putText(out, text, (x, y), font, font_scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
-                cv2.putText(out, text, (x, y), font, font_scale, (255, 255, 0), thickness, cv2.LINE_AA)
+            font_scale = 2.0
+            thickness = 5
+            margin = 0
+            y0 = 75
+            line_gap = 65
+            pad = 12
+            overlay_gap = 18  # extra vertical gap between successive overlay blocks
+            y_cursor: dict = {}  # running top-baseline per position
+            for overlay in count_overlays:
+                pos = overlay.get("position") or "left"
+                lines = [
+                    (overlay.get("gt_text"), (255, 255, 0)),
+                    (overlay.get("algo_text"), (0, 255, 0)),
+                    (overlay.get("diff_text"), (255, 0, 0)),
+                    (overlay.get("count_text"), (0, 200, 255)),
+                ]
+                visible_lines = [(text, color) for text, color in lines if text]
+                if not visible_lines:
+                    continue
+                cur_y = y_cursor.get(pos, y0)
+                # Measure all lines to draw a black background rectangle
+                text_sizes = [cv2.getTextSize(t, font, font_scale, thickness) for t, _ in visible_lines]
+                max_tw = max(sz[0][0] for sz in text_sizes)
+                text_h = text_sizes[0][0][1]
+                base_line = text_sizes[0][1]
+                n = len(visible_lines)
+                rect_top = max(0, cur_y - text_h - pad)
+                rect_bot = min(h - 1, cur_y + (n - 1) * line_gap + base_line + pad)
+                rect_left = max(0, margin - pad)
+                rect_right = margin + max_tw + pad
+                cv2.rectangle(out, (rect_left, rect_top), (rect_right, rect_bot), (0, 0, 0), -1)
+                for line_i, (text, color) in enumerate(visible_lines):
+                    x = margin
+                    y = cur_y + line_i * line_gap
+                    cv2.putText(out, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+                # Advance cursor so the next overlay for this position appears below
+                y_cursor[pos] = rect_bot + overlay_gap
 
         return out
+
+    def _build_count_mask_rgb(self, row: ResultRow, h: int, w: int) -> np.ndarray:
+        self._ensure_masked_seed(row, h, w)
+        pp = row.pp_masked
+        pp.ensure_shape(h, w)
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+
+        masks_and_colors = [
+            (pp.paint_mask_blue, np.array([0, 0, 255], dtype=np.uint8)),
+            (pp.paint_mask_pink, np.array([255, 0, 180], dtype=np.uint8)),
+            (pp.paint_mask_red, np.array([255, 0, 0], dtype=np.uint8)),
+            (pp.paint_mask_green, np.array([0, 255, 0], dtype=np.uint8)),
+        ]
+        for mask, color in masks_and_colors:
+            if mask is None:
+                continue
+            m = mask > 0
+            if np.any(m):
+                out[m] = color
+        return out
+
+    def _count_connected_components(self, mask: Optional[np.ndarray]) -> int:
+        if mask is None:
+            return 0
+        binary = (mask > 0).astype(np.uint8)
+        if not np.any(binary):
+            return 0
+        n_labels, _ = cv2.connectedComponents(binary, connectivity=8)
+        return max(0, int(n_labels) - 1)
+
+    def _count_cfus_from_mask(self, row: ResultRow, h: int, w: int) -> int:
+        self._ensure_masked_seed(row, h, w)
+        pp = row.pp_masked
+        pp.ensure_shape(h, w)
+        count = 0
+        # Green colonies minus yellow watershed boundaries
+        green = pp.paint_mask_green
+        if green is not None:
+            yellow = pp.paint_mask_yellow
+            if yellow is not None:
+                green_masked = ((green > 0) & (yellow == 0)).astype(np.uint8)
+            else:
+                green_masked = (green > 0).astype(np.uint8)
+            count += self._count_connected_components(green_masked)
+        # Manually painted colours counted separately; black is an eraser (not counted)
+        for mask in (pp.paint_mask_blue, pp.paint_mask_pink, pp.paint_mask_red):
+            count += self._count_connected_components(mask)
+        return int(count)
 
     def _apply_preview_contrast(self, img: np.ndarray) -> np.ndarray:
         alpha = max(1.0, float(self.preview_contrast_percent) / 100.0)
@@ -2592,13 +2837,14 @@ class MainWindow(QMainWindow):
         if row is None:
             return
         want_masked = self.preview_mode_masked.isChecked()
-        gt_overlays = self._get_gt_overlays_for_row(row)
+        count_overlays = self._get_count_overlays_for_row(row, current_count=row.current_count)
         try:
             original, masked = self._get_base_images(row)
             if want_masked:
-                composed = self._compose_with_annotations(masked, row.pp_masked, gt_overlays)
+                self._ensure_masked_seed(row, masked.shape[0], masked.shape[1])
+                composed = self._compose_with_annotations(masked, row.pp_masked, count_overlays)
             else:
-                composed = self._compose_with_annotations(original, row.pp_original, gt_overlays)
+                composed = self._compose_with_annotations(original, row.pp_original, count_overlays)
             composed = self._apply_preview_contrast(composed)
             self.preview_label.set_rgb(composed)
         except Exception:
@@ -2670,6 +2916,8 @@ class MainWindow(QMainWindow):
         pp = row.pp_masked if want_masked else row.pp_original
         h, w = base.shape[:2]
         pp.ensure_shape(h, w)
+        if want_masked:
+            self._ensure_masked_seed(row, h, w)
         # Push undo snapshot once per click (and once at drag start)
         if not is_drag:
             pp.push_undo()
@@ -2683,6 +2931,9 @@ class MainWindow(QMainWindow):
             if (lx - x) * (lx - x) + (ly - y) * (ly - y) <= 2:
                 return
         self._last_drag_xy = (x, y)
+
+        if self.active_tool in ("paint", "remove") and want_masked:
+            row.user_modified_mask = True
 
         if self.active_tool == "paint":
             if self.paint_color == "pink":
@@ -2706,7 +2957,7 @@ class MainWindow(QMainWindow):
 
         elif self.active_tool == "remove":
             # erase both colors smoothly
-            for m in (pp.paint_mask_blue, pp.paint_mask_pink, pp.paint_mask_red, pp.paint_mask_green, pp.paint_mask_black):
+            for m in (pp.paint_mask_blue, pp.paint_mask_pink, pp.paint_mask_red, pp.paint_mask_green, pp.paint_mask_yellow, pp.paint_mask_black):
                 if m is None:
                     continue
                 if is_drag and self._last_paint_xy is not None:
@@ -2766,6 +3017,7 @@ class MainWindow(QMainWindow):
             (pp.paint_mask_pink is not None and bool(np.any(pp.paint_mask_pink))) or
             (pp.paint_mask_red is not None and bool(np.any(pp.paint_mask_red))) or
             (pp.paint_mask_green is not None and bool(np.any(pp.paint_mask_green))) or
+            (pp.paint_mask_yellow is not None and bool(np.any(pp.paint_mask_yellow))) or
             (pp.paint_mask_black is not None and bool(np.any(pp.paint_mask_black)))
         )
         has_labels = bool(pp.labels)
@@ -2804,12 +3056,41 @@ class MainWindow(QMainWindow):
         if pp.paint_mask_red is not None:
             pp.paint_mask_red[:] = 0
         if pp.paint_mask_green is not None:
-            pp.paint_mask_green[:] = 0
+            if want_masked:
+                algo_mask = self._get_algorithm_mask(row)
+                if algo_mask is not None and algo_mask.shape == pp.paint_mask_green.shape:
+                    pp.paint_mask_green[:] = algo_mask
+                    row.masked_green_initialized = True
+                else:
+                    pp.paint_mask_green[:] = 0
+            else:
+                pp.paint_mask_green[:] = 0
+        if pp.paint_mask_yellow is not None:
+            if want_masked:
+                yellow_mask = self._get_yellow_boundary_mask(row, pp.paint_mask_yellow.shape[0], pp.paint_mask_yellow.shape[1])
+                if yellow_mask is not None and yellow_mask.shape == pp.paint_mask_yellow.shape:
+                    pp.paint_mask_yellow[:] = yellow_mask
+                else:
+                    pp.paint_mask_yellow[:] = 0
+            else:
+                pp.paint_mask_yellow[:] = 0
         if pp.paint_mask_black is not None:
             pp.paint_mask_black[:] = 0
         pp.labels = []
         pp.next_label = 1
 
+        row.user_modified_mask = False
+        row.current_count = None
+        self.on_table_select()
+
+    def on_update_count(self):
+        row = self._current_row()
+        if row is None:
+            return
+        _, masked = self._get_base_images(row)
+        count = self._count_cfus_from_mask(row, masked.shape[0], masked.shape[1])
+        row.current_count = count
+        row.user_modified_mask = True
         self.on_table_select()
 
     # ---------- CSV ----------
@@ -2837,7 +3118,12 @@ class MainWindow(QMainWindow):
             updates: Dict[str, int] = {}
             for r in targets:
                 dataname = Path(r.source_image).stem
-                count = len(r.pp_masked.labels) + len(r.pp_original.labels)
+                if not r.user_modified_mask and r.algorithm_counts:
+                    # No manual edits — trust the algorithm's authoritative count
+                    count = sum(r.algorithm_counts)
+                else:
+                    _, masked = self._get_base_images(r)
+                    count = self._count_cfus_from_mask(r, masked.shape[0], masked.shape[1])
                 updates[dataname] = int(count)
 
             # Merge with existing CSV instead of replacing everything.
@@ -2873,7 +3159,8 @@ class MainWindow(QMainWindow):
                     w.writerow([dataname, int(count)])
 
             self.status_lbl.setText(f"Saved CSV: {csv_path.name}")
-            QMessageBox.information(self, "CSV saved", f"Saved:\n{csv_path}")
+            if not getattr(self, "_suppress_csv_popup", False):
+                QMessageBox.information(self, "CSV saved", f"Saved:\n{csv_path}")
 
         except Exception:
             tb = traceback.format_exc()
@@ -2883,8 +3170,12 @@ class MainWindow(QMainWindow):
         """
         SAVE = saves CSV + writes annotated images to output folder.
         """
-        # Save CSV first
-        self.on_save_csv()
+        # Save CSV without its own popup (we show one combined popup at the end)
+        self._suppress_csv_popup = True
+        try:
+            self.on_save_csv()
+        finally:
+            self._suppress_csv_popup = False
 
         out_dir = self._csv_path()
         if out_dir is None:
@@ -2900,20 +3191,24 @@ class MainWindow(QMainWindow):
                 return
 
             for r in targets:
-                _original, masked = self._get_base_images(r)   # ✅ unpack tuple
+                _, masked = self._get_base_images(r)
 
-                gt_overlays = self._get_gt_overlays_for_row(r)
-                mask_ann = self._compose_with_annotations(masked, r.pp_masked, gt_overlays)
+                count_overlays = self._get_count_overlays_for_row(r, current_count=r.current_count)
+                self._ensure_masked_seed(r, masked.shape[0], masked.shape[1])
+                mask_ann = self._compose_with_annotations(masked, r.pp_masked, count_overlays)
+                mask_rgb = self._build_count_mask_rgb(r, masked.shape[0], masked.shape[1])
 
                 stem = Path(r.source_image).stem
                 p2 = out_dir / f"{stem}_annotated.tiff"
+                p3 = out_dir / f"{stem}_mask.tiff"
                 cv2.imwrite(str(p2), cv2.cvtColor(mask_ann, cv2.COLOR_RGB2BGR))
-            # refresh table/preview with newly written annotated files
-            saved = [str(out_dir / f"{Path(r.source_image).stem}_annotated.tiff") for r in targets]
-            self._attach_cpsam_outputs_to_originals(saved)
+                cv2.imwrite(str(p3), cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
 
-            self.status_lbl.setText("Saved CSV + annotated images")
-            QMessageBox.information(self, "Saved", f"Saved CSV + annotated images to:\n{out_dir}")
+            # Don't call _attach_cpsam_outputs_to_originals here: loading the saved
+            # _annotated.tiff as the new base would burn green/yellow into the background
+            # layer, making subsequent mask removal impossible.
+            self.status_lbl.setText("Saved CSV + annotated images + masks")
+            QMessageBox.information(self, "Saved", f"Saved CSV + annotated images + masks to:\n{out_dir}")
 
         except Exception:
             QMessageBox.critical(self, "Save error", traceback.format_exc())
@@ -3184,11 +3479,15 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
                 continue
             # New session should start from base mask, not previous *_annotated artifacts.
             base_tifs = [p for p in r.tif_paths if "_annotated" not in Path(p).stem.lower()]
+            base_expts = [p for p in r.expt_paths if "_annotated" not in Path(p).stem.lower()]
+            base_post_masks = [p for p in r.post_mask_paths if "_annotated" not in Path(p).stem.lower()]
             rows.append(
                 {
                     "image": Path(src).name,
                     "source_path": src,
                     "tif_paths": base_tifs,
+                    "expt_paths": base_expts,
+                    "post_mask_paths": base_post_masks,
                 }
             )
         if not rows:
@@ -3476,16 +3775,30 @@ def main():
     if app_icon_path.exists():
         src = QPixmap(str(app_icon_path))
         if not src.isNull():
-            rounded = QPixmap(src.size())
+            icon_size = 512
+            rounded = QPixmap(icon_size, icon_size)
             rounded.fill(Qt.transparent)
             painter = QPainter(rounded)
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            path = QPainterPath()
-            radius = min(src.width(), src.height()) * 0.22
-            path.addRoundedRect(rounded.rect(), radius, radius)
-            painter.setClipPath(path)
-            painter.drawPixmap(0, 0, src)
-            painter.end()
+            try:
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                path = QPainterPath()
+                outer_rect = QRectF(54.0, 54.0, 404.0, 404.0)
+                radius = 110.0
+                path.addRoundedRect(outer_rect, radius, radius)
+                painter.fillPath(path, QColor(255, 255, 255))
+                painter.setClipPath(path)
+                target_rect = QRect(
+                    int(round(outer_rect.x() + 58.0)),
+                    int(round(outer_rect.y() + 58.0)),
+                    int(round(outer_rect.width() - 116.0)),
+                    int(round(outer_rect.height() - 116.0)),
+                )
+                scaled = src.scaled(target_rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                draw_x = target_rect.x() + (target_rect.width() - scaled.width()) // 2
+                draw_y = target_rect.y() + (target_rect.height() - scaled.height()) // 2
+                painter.drawPixmap(draw_x, draw_y, scaled)
+            finally:
+                painter.end()
             app_icon = QIcon(rounded)
             app.setWindowIcon(app_icon)
 

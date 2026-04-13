@@ -64,6 +64,8 @@ BLOCK 6 · COUNT + ROI
 
 from __future__ import annotations
 
+import csv
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -419,6 +421,73 @@ def imsharpen_approx(img):
     return sharp
 
 
+def remove_background_rgb(
+    img_rgb: np.ndarray,
+    sigma: float = 80.0,
+    output_mean: float = 140.0,
+) -> np.ndarray:
+    """
+    Normalize the slowly-varying agar background so all dishes arrive at the
+    subsequent pipeline with a uniform mid-gray background, regardless of the
+    original agar color (yellow, pink, dark-red, white, …).
+
+    Method (normalized Gaussian background estimation + per-channel division):
+      1. For each color channel estimate the background B with a very large
+         Gaussian (sigma >> colony radius).  The Gaussian is weighted by the
+         valid-pixel mask (normalized convolution) so the zero-padded exterior
+         does not pull the background estimate low near the dish edge.
+      2. Divide: ratio = channel / B.  Ratio ≈ 1 on bare agar, < 1 where
+         colonies absorb more light — independent of original agar color.
+      3. Rescale by output_mean so the background lands at a fixed gray level
+         (140) compatible with the downstream imadjust_approx fixed-range map.
+      4. Restore the original zero mask (outside-dish pixels stay black).
+
+    Parameters
+    ----------
+    img_rgb     : uint8 RGB, zero-padded outside the dish mask.
+    sigma       : Gaussian sigma for background estimation.  80 px is safe for
+                  colonies with radius ≤ ~40 px at typical dish sizes.
+    output_mean : target background level in the returned uint8 image (0-255).
+                  140 falls within imadjust_approx's expected input range.
+    """
+    valid = np.any(img_rgb > 0, axis=2).astype(np.float32)
+    if float(valid.sum()) < 100:
+        return img_rgb  # empty or near-empty crop — nothing to do
+
+    # Use an eroded mask for background estimation only.
+    # The dish inner rim casts a dark shadow ring ~20-30px wide inside the dish
+    # boundary.  If rim pixels participate in the normalized-convolution background
+    # estimate, the Gaussian spreads their low values inward, making the
+    # background estimate too dark near the rim → ch/bg blows up → dark rim
+    # ring appears as a large false-positive colony blob.
+    # Eroding by 15px excludes the rim shadow zone from the bg numerator/
+    # denominator while still computing a correct background value AT those
+    # pixels (extrapolated from the brighter interior agar via the Gaussian).
+    rim_margin = 15
+    rim_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rim_margin + 1, 2 * rim_margin + 1))
+    inner_valid = cv2.erode(valid.astype(np.uint8), rim_se, iterations=1).astype(np.float32)
+
+    result = np.zeros_like(img_rgb)
+    for c in range(3):
+        ch = img_rgb[:, :, c].astype(np.float32)
+        # Normalized convolution over the INNER valid region only, so the dark
+        # rim shadow does not contaminate the background estimate.
+        num = cv2.GaussianBlur(ch * inner_valid, (0, 0), sigma)
+        den = cv2.GaussianBlur(inner_valid,       (0, 0), sigma) + 1e-6
+        bg  = num / den  # background estimate in [0, 255] float
+
+        # Guard against very dark background patches that cause blow-up.
+        bg_safe = np.maximum(bg, 8.0)
+
+        # Divide and rescale: background → output_mean, colonies stay darker.
+        scaled = (ch / bg_safe) * output_mean
+        result[:, :, c] = np.clip(scaled, 0, 255).astype(np.uint8)
+
+    # Restore dish mask: outside pixels must stay zero for downstream checks.
+    result[valid < 0.5] = 0
+    return result
+
+
 def _mean_region_area(bw: np.ndarray) -> float:
     lab = label(bw, connectivity=2)
     counts = np.bincount(lab.ravel())
@@ -463,13 +532,45 @@ def _crop_to_nonzero_bbox(rgb: np.ndarray, pad: int = 2) -> np.ndarray:
     return rgb[y0:y1, x0:x1].copy()
 
 
+def _looks_pre_cropped(rgb: np.ndarray) -> bool:
+    if rgb.size == 0:
+        return False
+    m = np.any(rgb != 0, axis=2) if rgb.ndim == 3 else (rgb != 0)
+    h, w = m.shape
+    if h < 16 or w < 16:
+        return False
+
+    nz_frac = float(np.count_nonzero(m)) / float(m.size)
+    if nz_frac <= 0.02 or nz_frac >= 0.995:
+        return False
+
+    bw = max(4, int(round(min(h, w) * 0.02)))
+    border = np.zeros_like(m, dtype=bool)
+    border[:bw, :] = True
+    border[-bw:, :] = True
+    border[:, :bw] = True
+    border[:, -bw:] = True
+
+    border_zero_frac = float(np.count_nonzero(~m[border])) / float(np.count_nonzero(border))
+    edge_touch_fracs = [
+        float(np.mean(m[:bw, :])),
+        float(np.mean(m[-bw:, :])),
+        float(np.mean(m[:, :bw])),
+        float(np.mean(m[:, -bw:])),
+    ]
+    max_edge_touch = max(edge_touch_fracs)
+
+    return border_zero_frac >= 0.25 and max_edge_touch >= 0.10
+
 def _get_expts_from_detectdish(
     rgb: np.ndarray,
     dish_mode: str,
     target_area_px2: float,
 ) -> List[Dict[str, np.ndarray]]:
     if dish_mode == "pre_cropped":
-        return [{"expt": rgb}]
+        return [{"expt": _crop_to_nonzero_bbox(rgb)}]
+    if dish_mode == "auto" and _looks_pre_cropped(rgb):
+        return [{"expt": _crop_to_nonzero_bbox(rgb)}]
     import DetectDish
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     fixed_diameter_px = 2.0 * float(np.sqrt(float(target_area_px2) / np.pi))
@@ -481,26 +582,77 @@ def _get_expts_from_detectdish(
     masked_rgb = cv2.cvtColor(masked_bgr, cv2.COLOR_BGR2RGB)
     if dish_mode == "single":
         return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
-    y_split = DetectDish.find_divider_y(
-        brightness,
-        ellipse_final,
-        bar_q=DetectDish.BAR_Q,
-        frac_thresh=DetectDish.BAR_FRAC_THRESH,
-        min_thick=DetectDish.BAR_MIN_THICK_PX,
-        max_thick=DetectDish.BAR_MAX_THICK_PX,
-    )
-    if y_split is None:
+
+    # --- Attempt to find a divider bar (half-dish split) ---
+    split_result = None
+    line_candidate = DetectDish.find_divider_line_dark(brightness, ellipse_final)
+    if line_candidate is not None:
+        p1, p2, line_score = line_candidate
+        if dish_mode == "double" or line_score >= DetectDish.BAR_LINE_SCORE_THRESH_AUTO:
+            split_result = DetectDish.mask_top_bottom_from_line(
+                image_bgr=bgr,
+                ellipse=ellipse_final,
+                p1=p1,
+                p2=p2,
+                gap=DetectDish.BAR_SPLIT_MARGIN_PX,
+                bar_half_width=DetectDish.BAR_MAX_THICK_PX // 2,
+                brightness=brightness,
+            )
+
+    bar_extents = None
+    if split_result is None:
+        bar_extents = DetectDish.find_divider_y(
+            brightness,
+            ellipse_final,
+            bar_q=DetectDish.BAR_Q,
+            frac_thresh=DetectDish.BAR_FRAC_THRESH,
+            min_thick=DetectDish.BAR_MIN_THICK_PX,
+            max_thick=DetectDish.BAR_MAX_THICK_PX,
+        )
+
+    if split_result is None and bar_extents is None:
         return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
-    top_bgr, bot_bgr = DetectDish.mask_top_bottom(
-        image_bgr=bgr,
-        ellipse=ellipse_final,
-        y_split=y_split,
-        gap=DetectDish.BAR_SPLIT_MARGIN_PX,
-    )
+
+    if split_result is None:
+        y0_bar, y1_bar = bar_extents
+        split_result = DetectDish.mask_top_bottom(
+            image_bgr=bgr,
+            ellipse=ellipse_final,
+            y_bar_top=y0_bar,
+            y_bar_bot=y1_bar,
+            margin=DetectDish.BAR_SPLIT_MARGIN_PX,
+            brightness=brightness,
+        )
+
+    top_bgr, bot_bgr = split_result
     top_rgb = cv2.cvtColor(top_bgr, cv2.COLOR_BGR2RGB)
     bot_rgb = cv2.cvtColor(bot_bgr, cv2.COLOR_BGR2RGB)
-    return [{"expt": _crop_to_nonzero_bbox(top_rgb)}, {"expt": _crop_to_nonzero_bbox(bot_rgb)}]
 
+    top_crop = _crop_to_nonzero_bbox(top_rgb)
+    bot_crop = _crop_to_nonzero_bbox(bot_rgb)
+
+    # ------------------------------------------------------------------
+    # Validate the split: each half must own a meaningful fraction of the
+    # total dish area.  A genuine half-dish produces two halves of roughly
+    # equal size (each ≈ 35–50 %).  A false-positive divider on a full
+    # dish yields one tiny sliver and one nearly-full region.
+    #
+    # If either half is below the threshold, discard the split and return
+    # the whole dish as a single experiment.
+    # ------------------------------------------------------------------
+    _MIN_HALF_FRAC = 0.20  # each half must be ≥ 20 % of total dish
+
+    total_dish_nz = float(np.count_nonzero(np.any(masked_rgb > 0, axis=2)))
+    if total_dish_nz > 0:
+        top_nz = float(np.count_nonzero(np.any(top_crop > 0, axis=2)))
+        bot_nz = float(np.count_nonzero(np.any(bot_crop > 0, axis=2)))
+        top_frac = top_nz / total_dish_nz
+        bot_frac = bot_nz / total_dish_nz
+        if top_frac < _MIN_HALF_FRAC or bot_frac < _MIN_HALF_FRAC:
+            # Split is lopsided → false divider on a full dish
+            return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+
+    return [{"expt": top_crop}, {"expt": bot_crop}]
 
 # ===========================================================================
 # BLOCK 1 — Preprocessing
@@ -538,6 +690,13 @@ def preprocess_expt(
     _cached = _PREPROCESS_CACHE.get(_cache_key)
     if _cached is not None:
         return _cached
+
+    # --- background normalisation: makes all agar colors look the same ---
+    # Must run before imadjust_approx because imadjust uses fixed per-channel
+    # clip ranges calibrated for a specific agar brightness.  After this step
+    # the agar background is always near 140 DN, so imadjust sees consistent
+    # input regardless of whether the agar was yellow, pink, dark-red, or white.
+    expt = remove_background_rgb(expt)
 
     # --- standard chain (identical to _count_one_expt_full_logic) ---
     expt_adj = imadjust_approx(expt)                           # stretch contrast per channel
@@ -868,7 +1027,7 @@ def _recover_second_pass_blobs(
     if not np.any(lost):
         return bw_clean
 
-    bw_soft = imextendedmin(gray_expt, 15) & (gray_expt != 0)
+    bw_soft = imextendedmin(gray_expt, 8) & (gray_expt != 0)
     already_covered = binary_dilation(bw_clean, footprint=_disk(10))
     uncovered = bw_soft & lost & ~already_covered
     if not np.any(uncovered):
@@ -899,6 +1058,117 @@ def _recover_second_pass_blobs(
         bw_clean[r0:r1, c0:c1] |= ndi.binary_fill_holes(crop)
 
     return bw_clean
+
+
+def _expand_mask_to_dark_colony_halos(
+    bw_clean: np.ndarray,
+    expt_rgb: np.ndarray,
+    gray_expt: np.ndarray,
+    dish_area: int,
+) -> np.ndarray:
+    """
+    Grow accepted CFU cores into the surrounding dark colony footprint for
+    the final segmentation. This must happen before watershed so the drawn
+    green fill and yellow watershed boundaries describe the same object.
+    """
+    bw_clean = bw_clean.astype(bool)
+    if not np.any(bw_clean):
+        return bw_clean
+
+    dish_mask = np.any(expt_rgb > 0, axis=2)
+    if not np.any(dish_mask):
+        return bw_clean
+
+    gray_raw = _gray_uint8(expt_rgb).astype(np.float32)
+    valid_f = dish_mask.astype(np.float32)
+    bg_num = cv2.GaussianBlur(gray_raw * valid_f, (0, 0), sigmaX=34.0, sigmaY=34.0)
+    bg_den = cv2.GaussianBlur(valid_f, (0, 0), sigmaX=34.0, sigmaY=34.0) + 1e-6
+    local_bg = bg_num / bg_den
+    dark_contrast = local_bg - gray_raw
+
+    vals = dark_contrast[dish_mask]
+    if vals.size < 100:
+        return bw_clean
+
+    contrast_thr = float(np.clip(np.percentile(vals, 66), 5.0, 14.0))
+    dark_candidate = dish_mask & (dark_contrast >= contrast_thr)
+
+    nz = gray_expt[dish_mask]
+    if nz.size >= 100:
+        gray_med = float(np.median(nz))
+        gray_thr = float(np.percentile(nz, 42))
+        if gray_thr < gray_med - 5.0:
+            dark_candidate |= dish_mask & (gray_expt.astype(np.float32) <= gray_thr)
+
+    coverage = float(np.count_nonzero(bw_clean)) / dish_area if dish_area > 0 else 0.0
+    if coverage > 0.15:
+        grow_r = 4
+    elif coverage > 0.10:
+        grow_r = 8
+    elif coverage > 0.08:
+        grow_r = 16
+    else:
+        grow_r = 34
+    local_neighborhood = binary_dilation(bw_clean, footprint=_disk(grow_r))
+    allowed = dark_candidate & local_neighborhood
+
+    # Do not let expansion walk into leftover divider-bar shadows. Those are
+    # usually broad, flat, horizontal components near a crop edge; if they are
+    # connected to a nearby colony seed, unconstrained geodesic growth makes an
+    # unnatural green shelf and gives watershed a bad boundary.
+    lab_allowed = label(allowed, connectivity=2)
+    protected_seed_zone = binary_dilation(bw_clean, footprint=_disk(8))
+    h, w = allowed.shape
+    for reg in regionprops(lab_allowed):
+        minr, minc, maxr, maxc = reg.bbox
+        comp_h = int(maxr - minr)
+        comp_w = int(maxc - minc)
+        if comp_h <= 0 or comp_w <= 0:
+            continue
+        touches_horizontal_edge = minr <= 2 or maxr >= h - 2
+        broad_band = comp_w >= int(0.18 * w) and comp_w >= 4 * comp_h
+        edge_band = touches_horizontal_edge and comp_w >= int(0.06 * w) and comp_w >= 2 * comp_h
+        if broad_band or edge_band:
+            comp = lab_allowed == reg.label
+            allowed[comp & ~protected_seed_zone] = False
+
+    expanded = bw_clean.copy()
+    for _ in range(max(1, grow_r)):
+        nxt = binary_dilation(expanded, footprint=_disk(1)) & allowed
+        nxt |= bw_clean
+        if np.array_equal(nxt, expanded):
+            break
+        expanded = nxt
+
+    expanded = ndi.binary_fill_holes(expanded)
+    expanded &= dish_mask
+
+    # Final safety cap: expansion is for boundary recovery, not discovering
+    # new large structures. If a broad dark background/bar component is
+    # connected to a seed, keep the pixels nearest the accepted core and
+    # discard the runaway halo.
+    lab_exp = label(expanded, connectivity=2)
+    if int(lab_exp.max()) > 0:
+        dist_from_seed = ndi.distance_transform_edt(~bw_clean)
+        capped = np.zeros_like(expanded, dtype=bool)
+        for reg in regionprops(lab_exp):
+            comp = lab_exp == reg.label
+            seed_area = int(np.count_nonzero(comp & bw_clean))
+            if seed_area <= 0:
+                continue
+            comp_area = int(reg.area)
+            max_area = int(max(seed_area * 9, seed_area + 2500))
+            if comp_area <= max_area:
+                capped |= comp
+                continue
+
+            rr, cc = np.where(comp)
+            d = dist_from_seed[rr, cc]
+            keep_n = min(max_area, rr.size)
+            keep_idx = np.argpartition(d, keep_n - 1)[:keep_n]
+            capped[rr[keep_idx], cc[keep_idx]] = True
+        expanded = capped
+    return expanded
 
 
 def _count_colonies_with_instances(
@@ -1096,7 +1366,7 @@ def _count_one_expt_hsv(
     # nearly the whole image and produces no useful border zone.
     # The original expt has clean hard zeros outside the circular crop.
     dish_mask_orig = np.any(expt > 0, axis=2)
-    border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=5)
+    border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=12)
     n_border = int(np.count_nonzero(border_px))
     bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
 
@@ -1116,18 +1386,23 @@ def _count_one_expt_hsv(
     dish_area = int(np.count_nonzero(gray_expt != 0))
     bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
 
+    # Expand accepted cores to the visible dark colony footprint BEFORE
+    # watershed. This keeps the green fill, post mask, and yellow split
+    # boundaries in the same geometry.
+    bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
+
     # --- BLOCKS 4+5+6: candidate filtering + watershed + count/ROI ---
     # Pass the ORIGINAL (non-preprocessed) image so the green overlay lands
     # on unaltered pixel colours, not the contrast-boosted version.
     num_cfu, out_image, colony_roi, cluster_roi, _ = _count_colonies_with_instances(
-        bw_clean, expt, params, build_overlay=True, build_rois=build_rois
+        bw_segment, expt, params, build_overlay=True, build_rois=build_rois
     )
 
     # Hard ceiling (same as original)
     if num_cfu > int(params.uncountable_cutoff):
-        return int(num_cfu), "Uncountable", "Uncountable", 0.0, np.array([]), [], [], expt_adj, gray_expt
+        return int(num_cfu), "Uncountable", "Uncountable", 0.0, np.array([]), [], [], np.zeros((*expt.shape[:2], 3), dtype=np.uint8)
 
-    mean_area = _mean_region_area(bw_clean)
+    mean_area = _mean_region_area(bw_segment)
 
     if mean_area <= 150:
         size_class = "small"
@@ -1136,7 +1411,7 @@ def _count_one_expt_hsv(
     else:
         size_class = "large"
 
-    bw_post_rgb = cv2.cvtColor((bw_clean.astype(np.uint8) * 255), cv2.COLOR_GRAY2RGB)
+    bw_post_rgb = cv2.cvtColor((bw_segment.astype(np.uint8) * 255), cv2.COLOR_GRAY2RGB)
     return int(num_cfu), "HSV", size_class, float(mean_area), out_image, colony_roi, cluster_roi, bw_post_rgb
 
 
@@ -1182,13 +1457,14 @@ def predict_count_only_hsv(
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
         dish_mask_orig = np.any(expt > 0, axis=2)
-        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=5)
+        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=12)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
         bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+        bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
 
         num_cfu, _, _, _, _ = _count_colonies_with_instances(
-            bw_clean, expt, params, build_overlay=False, build_rois=False
+            bw_segment, expt, params, build_overlay=False, build_rois=False
         )
         total += int(num_cfu)
     return total
@@ -1266,16 +1542,17 @@ def predict_tuning_features(
 
         # --- Rim filter ---
         dish_mask_orig = np.any(expt > 0, axis=2)
-        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=5)
+        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=12)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
 
         # --- Second pass: recover blobs lost in morpho_cleanup on sparse plates ---
         bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+        bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
 
         # --- BLOCKS 4+5+6: count + instance labels ---
         num_cfu, _, _, _, inst_labels = _count_colonies_with_instances(
-            bw_clean, expt, params, build_overlay=False, build_rois=False
+            bw_segment, expt, params, build_overlay=False, build_rois=False
         )
 
         # Hard ceiling
@@ -1291,7 +1568,7 @@ def predict_tuning_features(
         _, cnts = np.unique(inst_labels[inst_labels > 0], return_counts=True)
         all_instance_areas.extend(float(c) for c in cnts)
 
-        mean_area = _mean_region_area(bw_clean)
+        mean_area = _mean_region_area(bw_segment)
         mean_areas.append(float(mean_area))
 
         if mean_area <= 150:
@@ -1348,6 +1625,7 @@ def count_cfu_app2(
     out_paths: List[str] = []
     counts: List[int] = []
 
+    n_expts = len(expts)
     for k, item in enumerate(expts, start=1):
         expt = item["expt"]
         num_cfu, _, _, _, out_image, _, _, bw_post_rgb = _count_one_expt_hsv(
@@ -1355,7 +1633,11 @@ def count_cfu_app2(
         )
         counts.append(int(num_cfu))
 
-        expt_id = top_cell if k == 1 else bot_cell
+        if n_expts >= 2:
+            expt_id = top_cell if k == 1 else bot_cell
+        else:
+            # Single / full dish: use the plain stem (top_cell without any suffix)
+            expt_id = top_cell.removesuffix("_Top") if top_cell.endswith("_Top") else top_cell
         base = folder_dir / version / expt_id
 
         if save_which in ("overlay", "both"):
@@ -1371,12 +1653,9 @@ def count_cfu_app2(
             save_tiff_rgb(expt_tif, expt)
             out_paths.append(str(expt_tif))
 
-        # Save the post-cleanup mask into a hidden cache subfolder so it
-        # doesn't clutter the output directory. The desktop app reads it
-        # from there to seed the editable mask layer.
-        post_cache_dir = base.parent / ".mask_cache"
-        post_cache_dir.mkdir(parents=True, exist_ok=True)
-        post_tif = post_cache_dir / (base.name + "__post.tif")
+        # Save the post-cleanup mask to the system temp dir so it never
+        # appears in the user's output directory.
+        post_tif = Path(tempfile.gettempdir()) / (base.name + "__post.tif")
         save_tiff_rgb(post_tif, bw_post_rgb)
         out_paths.append(str(post_tif))
 
@@ -1384,6 +1663,98 @@ def count_cfu_app2(
         return {"out_paths": out_paths, "counts": counts}
 
     return out_paths
+
+
+def _predict_test_rows(
+    rgb: np.ndarray,
+    image_name: str,
+    dish_mode: str = "auto",
+    target_area_px2: float = 2245000.0,
+    use_blackhat: bool = False,
+    params: Optional[TuningParams] = None,
+) -> List[Dict[str, Any]]:
+    params = params or TuningParams()
+    expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
+    rows: List[Dict[str, Any]] = []
+    image_stem = Path(image_name).stem
+    n_expts = len(expts)
+
+    for k, item in enumerate(expts, start=1):
+        expt = item["expt"]
+        if n_expts >= 2:
+            petri_dish = image_stem if k == 1 else f"{image_stem}_Bottom"
+        else:
+            petri_dish = image_stem
+
+        features = predict_tuning_features(
+            expt,
+            dish_mode="pre_cropped",
+            target_area_px2=float(target_area_px2),
+            use_blackhat=use_blackhat,
+            params=params,
+        )
+
+        count = int(features.get("count", 0))
+        instance_areas = [float(a) for a in features.get("instance_areas", [])]
+        methods = ",".join(str(v) for v in features.get("methods", []))
+        classes = ",".join(str(v) for v in features.get("classes", []))
+        mean_area = float(features.get("mean_area", 0.0))
+
+        if not instance_areas:
+            rows.append(
+                {
+                    "image_name": image_name,
+                    "petri_dish": petri_dish,
+                    "dish_index": k,
+                    "count": count,
+                    "cfu_index": "",
+                    "cfu_area_px": "",
+                    "mean_area_px": mean_area,
+                    "methods": methods,
+                    "classes": classes,
+                }
+            )
+            continue
+
+        for i, area in enumerate(instance_areas, start=1):
+            rows.append(
+                {
+                    "image_name": image_name,
+                    "petri_dish": petri_dish,
+                    "dish_index": k,
+                    "count": count,
+                    "cfu_index": i,
+                    "cfu_area_px": area,
+                    "mean_area_px": mean_area,
+                    "methods": methods,
+                    "classes": classes,
+                }
+            )
+
+    return rows
+
+
+def _write_test_csv(rows: List[Dict[str, Any]], outdir: Path) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    csv_path = outdir / "countCFUAPP2_test_results.csv"
+    fieldnames = [
+        "image_name",
+        "petri_dish",
+        "dish_index",
+        "count",
+        "cfu_index",
+        "cfu_area_px",
+        "mean_area_px",
+        "methods",
+        "classes",
+        "total_runtime_sec",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return csv_path
 
 
 # ===========================================================================
@@ -1402,6 +1773,7 @@ def _collect_images(path: Path) -> List[Path]:
 
 if __name__ == "__main__":
     import argparse
+    t0_total = time.perf_counter()
 
     parser = argparse.ArgumentParser(description="HSV-first CFU counter (countCFUAPP2)")
     parser.add_argument("--image",  required=True,
@@ -1415,6 +1787,8 @@ if __name__ == "__main__":
                         choices=["overlay", "expt", "both"])
     parser.add_argument("--blackhat",        action="store_true",
                         help="Enable blackhat preprocessing to enhance faint colonies")
+    parser.add_argument("--Test", action="store_true",
+                        help="Write a CSV in outdir with per-petridish counts and per-CFU areas")
     args = parser.parse_args()
 
     input_path = Path(args.image)
@@ -1422,6 +1796,9 @@ if __name__ == "__main__":
     if not image_files:
         raise RuntimeError(f"No images found at: {input_path}")
 
+    all_paths: List[str] = []
+    test_rows: List[Dict[str, Any]] = []
+    csv_path = None
     for img_path in image_files:
         img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -1442,5 +1819,25 @@ if __name__ == "__main__":
             save_which=args.save_which,
             use_blackhat=args.blackhat,
         )
-    for p in paths:
+        all_paths.extend(list(paths))
+        if args.Test:
+            new_rows = _predict_test_rows(
+                rgb=img,
+                image_name=img_path.name,
+                dish_mode=args.dish_mode,
+                target_area_px2=args.target_area_px2,
+                use_blackhat=args.blackhat,
+            )
+            elapsed = float(time.perf_counter() - t0_total)
+            for row in new_rows:
+                row["total_runtime_sec"] = elapsed
+            test_rows.extend(new_rows)
+            csv_path = _write_test_csv(test_rows, Path(args.outdir))
+            print(f"[CSV] {csv_path}  ({len(test_rows)} rows, elapsed {elapsed:.1f}s)")
+    for p in all_paths:
         print(p)
+    if args.Test:
+        total_runtime_sec = float(time.perf_counter() - t0_total)
+        if csv_path:
+            print(csv_path)
+        print(f"[OK] Total runtime: {total_runtime_sec:.3f} s")

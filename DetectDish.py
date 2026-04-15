@@ -1,12 +1,12 @@
 # ------------------------------
 # PETRI DISH DETECTION + MASKING
 # ------------------------------
-# Detects petri dish, masks everything outside, saves masked images.
-# Uses contour-based ellipse detection + center refinement on edge score,
-# while forcing a fixed circle diameter derived from DEFAULT_TARGET_AREA_PX2.
-# Version 1.1: Also top & bottom dishes can be handled.
+# Detects a petri dish, masks everything outside the dish, and optionally
+# splits top/bottom half-dish images across a dark divider bar.
+# Uses contour-based circle initialization, edge-score center refinement, and
+# a fixed target dish area for stable output size.
 #
-# Version: 1.1 (22-02-2026)
+# Version: 1.1 (13-04-2026)
 # ------------------------------
 
 import argparse
@@ -15,62 +15,53 @@ import numpy as np
 import os
 import glob
 import re
+import warnings
 
 # ------------------------------
-# Defaults / User settings
+# Defaults and tuning parameters
 # ------------------------------
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif")
 
 DEFAULT_MAX_IMAGES = 100                 # set to 0 or negative to process all
 DEFAULT_TARGET_AREA_PX2 = 2245000        # dish area in pixels^2
 
-# Parameters used for Optimization of center position (after initial ellipse fit)
-CENTER_ITERS = 40
+# Center refinement after the initial ellipse fit.
+CENTER_ITERS = 50
 CENTER_LR = 0.5
 CENTER_FD_EPS = 3
-CENTER_MAX_SHIFT_PX = 400.0
+CENTER_MAX_SHIFT_PX = 450.0
 
-# Conservative size adaptation: allow the detected circle to be slightly smaller than
-# fixed_diameter_px when strong edge evidence supports it (~5% of dishes).
-# Only accepted if the edge score improves by at least CENTER_SHRINK_MIN_GAIN (10%).
-# This high threshold leaves all normally-sized dishes untouched.
-CENTER_SHRINK_CANDIDATES  = [0.99, 0.98, 0.97, 0.96, 0.95]  # try up to 5 % smaller
-CENTER_SHRINK_MIN_GAIN    = 0.10   # require 10 % edge-score improvement to accept
-CENTER_SHRINK_REFINE_ITERS = 12    # quick center re-tune iterations per candidate
+# Allow slight diameter shrinkage only when edge evidence improves clearly.
+CENTER_SHRINK_CANDIDATES  = [0.99, 0.98, 0.97, 0.96, 0.95, 0.94]  # try up to 5 % smaller
+CENTER_SHRINK_MIN_GAIN    = 0.30  # require 10 % edge-score improvement to accept
+CENTER_SHRINK_REFINE_ITERS = 15    # quick center re-tune iterations per candidate
 
-# Edge scoring parameters for ellipse center optimization
+# Edge scoring for circle center optimization.
 EDGE_SCORE_MODE = "p75"     # "mean" | "median" | "p75"
 SMOOTH_K = 7                # odd >=3; 0 disables | smoothing of edge scores on the ellipse rim to reduce noise sensitivity
-N_SAMPLES = 720             # number of points to sample on the ellipse rim for edge scoring
+N_SAMPLES = 750             # number of points to sample on the ellipse rim for edge scoring
 
-# Params for Half bar search
+# Dark divider-bar detection and cleanup.
 BAR_Q = 15                 # Row-wise 10th percentile intensity (robust to colonies/background)
 BAR_FRAC_THRESH = 0.3     # Row is "bar" if row_stat < median(row_stat) * BAR_FRAC_THRESH
 BAR_MIN_THICK_PX = 10      # ignore tiny runs (noise)
-BAR_MAX_THICK_PX = 120     # ignore huge dark regions (bad illumination / glove)
+BAR_MAX_THICK_PX = 60     # ignore huge dark regions (bad illumination / glove)
 BAR_SPLIT_MARGIN_PX = 20   # don’t include the divider pixels in either half
 BAR_BALANCE_WEIGHT = 1.35  # favor runs that split the dish into similarly sized halves
 BAR_RELAXED_FRAC_MULT = 1.35
-BAR_RELAXED_MIN_THICK = 6
+BAR_RELAXED_MIN_THICK = 15
 BAR_RELAXED_MAX_THICK = 180
-BAR_LINE_MAX_ABS_ANGLE_DEG = 20.0
+BAR_LINE_MAX_ABS_ANGLE_DEG = 22.0
 BAR_LINE_MIN_LEN_FRAC = 0.35
 BAR_LINE_SCORE_THRESH_AUTO = 1.15
 
-# ── NEW: Dish border erosion ──────────────────────────────────────────
-# Shrink the final ellipse mask inward by this many pixels so the
-# bright/dark petri-dish rim is excluded from the output.
+# Dish rim and seam cleanup.
 BORDER_EROSION_PX = 25          # 15-25 px works well for ~1700 px dishes
-
-# ── NEW: Bar post-cleanup ────────────────────────────────────────────
-# After the top/bottom split, scan rows near the cut boundary.
-# Any row whose median brightness (inside the dish) is below
-# BAR_CLEANUP_DARK_THRESH_FRAC × (dish median) is painted black.
 BAR_CLEANUP_BAND_PX = 60        # how many rows from the seam to inspect
 BAR_CLEANUP_DARK_THRESH_FRAC = 0.45   # row is "bar remnant" if < 45 % of dish median
 BAR_ADAPTIVE_MARGIN_MULT = 1.9  # widen detected bar extent by this factor
 
-# Grid-searched param fallbacks for initial ellipse detection
+# Fallback parameter sets for initial ellipse detection.
 PARAM_SETS = [
     {"blur_ks": 15, "close_ks": 19},
     {"blur_ks": 7,  "close_ks": 19},
@@ -85,7 +76,7 @@ PARAM_SETS = [
 
 
 # ----------------------------
-# Edge utility functions
+# Mask and edge helpers
 # ----------------------------
 def make_eroded_ellipse_mask(shape_hw, ellipse, erosion_px):
     """
@@ -108,10 +99,11 @@ def cleanup_bar_remnants(masked_half, brightness, ellipse,
                          band_px=BAR_CLEANUP_BAND_PX,
                          dark_frac=BAR_CLEANUP_DARK_THRESH_FRAC):
     """
-    After splitting, inspect rows near the seam (the side that faced the
-    divider bar).  Any row whose in-dish median brightness is suspiciously
-    dark compared to the overall dish median is painted black → kills
-    leftover bar pixels that the margin didn't catch.
+    Remove leftover divider-bar pixels near the split seam.
+
+    The first pass blacks out dark seam rows; the second pass removes dark
+    connected components in the seam band when they touch the cut edge or span
+    like a bar. Isolated round colonies near the seam are preserved.
 
     Parameters
     ----------
@@ -126,7 +118,6 @@ def cleanup_bar_remnants(masked_half, brightness, ellipse,
     cv2.ellipse(dish_mask, ellipse, 255, -1)
     inside = dish_mask > 0
 
-    # Overall dish median brightness (reference level)
     dish_vals = brightness[inside]
     if dish_vals.size == 0:
         return masked_half
@@ -136,24 +127,18 @@ def cleanup_bar_remnants(masked_half, brightness, ellipse,
 
     thresh = dish_median * dark_frac
 
-    # Identify the row range near the seam
-    # For the TOP half, the seam is at the bottom of the visible area
-    # For the BOTTOM half, the seam is at the top of the visible area
     half_mask = np.any(masked_half > 0, axis=2)  # rows that have content
     active_rows = np.where(half_mask.any(axis=1))[0]
     if active_rows.size == 0:
         return masked_half
 
     if seam_side == "bottom":
-        # top half → seam is at the bottom edge of visible content
         scan_start = max(int(active_rows[-1]) - band_px, int(active_rows[0]))
         scan_end   = int(active_rows[-1]) + 1
     else:
-        # bottom half → seam is at the top edge of visible content
         scan_start = int(active_rows[0])
         scan_end   = min(int(active_rows[0]) + band_px + 1, int(active_rows[-1]) + 1)
 
-    # Walk row by row; black-out any that are still dark
     out = masked_half.copy()
     for y in range(scan_start, scan_end):
         row_mask = inside[y]
@@ -161,12 +146,8 @@ def cleanup_bar_remnants(masked_half, brightness, ellipse,
             continue
         row_med = float(np.median(brightness[y, row_mask]))
         if row_med < thresh:
-            out[y, :, :] = 0          # paint entire row black
+            out[y, :, :] = 0
 
-    # Row medians can miss a partially slanted bar remnant because a row may
-    # contain enough bright agar to lift the median. Remove dark connected
-    # components in the seam band when they touch the cut side or span like a
-    # bar, while leaving isolated round colonies near the seam alone.
     band_mask = np.zeros((h, w), dtype=bool)
     band_mask[scan_start:scan_end, :] = True
     dark_band = inside & band_mask & (brightness.astype(np.float32) < float(thresh))
@@ -177,7 +158,8 @@ def cleanup_bar_remnants(masked_half, brightness, ellipse,
         iterations=1,
     ) > 0
 
-    lab, n_lab = ndi_label_compat(dark_band)
+    n_total, lab = cv2.connectedComponents(dark_band.astype(np.uint8), connectivity=8)
+    n_lab = int(n_total - 1)
     if n_lab > 0:
         if seam_side == "bottom":
             seam_rows = lab[max(scan_end - 3, scan_start):scan_end, :]
@@ -198,14 +180,6 @@ def cleanup_bar_remnants(masked_half, brightness, ellipse,
         out[remove] = 0
     return out
 
-
-def ndi_label_compat(mask):
-    """
-    Small local wrapper so DetectDish stays SciPy-free; returns skimage-like
-    labels using OpenCV connected components.
-    """
-    n, lab = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
-    return lab, int(n - 1)
 
 def ellipse_points(ellipse, n=360):
     """
@@ -228,7 +202,7 @@ def ellipse_points(ellipse, n=360):
 
 def edge_map_from_brightness(brightness):
     """
-    Compute edge magnitude map from brightness image using Sobel filters. Blur first to reduce noise sensitivity.
+    Compute a normalized Sobel edge-magnitude map from a brightness image.
     """
     blur = cv2.GaussianBlur(brightness, (5, 5), 0)
     gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
@@ -240,7 +214,7 @@ def edge_map_from_brightness(brightness):
 
 def edge_score_for_ellipse(ellipse, edge_mag, mode="p75", n=360, smooth_k=0):
     """
-    Compute an edge score for the given ellipse by sampling points on its perimeter and aggregating edge magnitudes.
+    Score an ellipse by sampling edge magnitudes along its perimeter.
     """
     pts = ellipse_points(ellipse, n=n)
     h, w = edge_mag.shape[:2]
@@ -248,7 +222,6 @@ def edge_score_for_ellipse(ellipse, edge_mag, mode="p75", n=360, smooth_k=0):
     ys = np.clip(np.round(pts[:, 1]).astype(int), 0, h - 1)
     vals = edge_mag[ys, xs]
 
-    # Optional smoothing of edge scores to reduce noise sensitivity
     if smooth_k and smooth_k >= 3 and len(vals) >= smooth_k:
         k = int(smooth_k)
         if k % 2 == 0:
@@ -256,21 +229,19 @@ def edge_score_for_ellipse(ellipse, edge_mag, mode="p75", n=360, smooth_k=0):
         ker = np.ones(k, dtype=np.float32) / k
         vals = np.convolve(vals.astype(np.float32), ker, mode="same")
 
-    # Aggregate edge magnitudes using the specified mode
     if mode == "mean":
         return float(vals.mean())
     if mode == "median":
         return float(np.median(vals))
     return float(np.percentile(vals, 75))
 
-#----------------------------
+# ----------------------------
 # Center refinement with fixed circle diameter
-#----------------------------
+# ----------------------------
 
 def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_px):
     """
-    Force a fixed circle diameter (d1=d2=fixed_diameter_px) and optimize center (cx,cy)
-    to maximize edge score on the rim.
+    Fit a fixed-diameter circle by moving its center to maximize rim edge score.
     """
     edge_mag = edge_map_from_brightness(brightness)
 
@@ -278,9 +249,8 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
     cx, cy = float(cx0), float(cy0)
 
     d = float(fixed_diameter_px)
-    angle = 0.0  # irrelevant for circle, optionally add later if needed for ellipse cases
+    angle = 0.0
 
-    # Helper to clamp center shifts to a max amount to prevent divergence
     def clamp_center(cxx, cyy):
         dx = cxx - cx0
         dy = cyy - cy0
@@ -290,15 +260,12 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
         s = CENTER_MAX_SHIFT_PX / (r + 1e-9)
         return float(cx0 + s * dx), float(cy0 + s * dy)
 
-    # Objective function for center optimization
     def obj(cxx, cyy):
         e = ((float(cxx), float(cyy)), (d, d), angle)
         return edge_score_for_ellipse(e, edge_mag, mode=EDGE_SCORE_MODE, n=N_SAMPLES, smooth_k=SMOOTH_K)
 
-    # Initial best score at the original center
     best = (cx, cy, obj(cx, cy))
 
-    # Gradient ascent iterations to refine center position
     for _ in range(CENTER_ITERS):
         f0 = obj(cx, cy)
 
@@ -309,18 +276,15 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
         fyp = obj(cx, cy + CENTER_FD_EPS)
         fym = obj(cx, cy - CENTER_FD_EPS)
 
-        # Gradient descent step for center position
         gy = (fyp - fym) / (2.0 * CENTER_FD_EPS)
 
         cx_new = cx + CENTER_LR * gx
         cy_new = cy + CENTER_LR * gy
 
-        # Clamp center shifts to prevent divergence
         cx_new, cy_new = clamp_center(cx_new, cy_new)
 
         f1 = obj(cx_new, cy_new)
 
-        # backoff if worse
         if f1 < f0:
             cx_new = cx + 0.25 * CENTER_LR * gx
             cy_new = cy + 0.25 * CENTER_LR * gy
@@ -329,12 +293,10 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
 
         cx, cy = cx_new, cy_new
 
-        # Update best score and corresponding center if improved
         if f1 > best[2]:
             best = (cx, cy, f1)
 
-    # Phase 2: fine-grained pass starting from global best, smaller step + tighter FD_EPS.
-    # Polishes the last few pixels of placement that the coarse phase may miss.
+    # Fine pass for the last few pixels of placement.
     cx, cy = best[0], best[1]
     for _ in range(20):
         f0 = obj(cx, cy)
@@ -362,8 +324,7 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
         if f1 > best[2]:
             best = (cx, cy, f1)
 
-    # Final pixel-grid scan: try all ±2 px offsets from best, pick the maximum.
-    # Ensures pixel-level precision after gradient ascent.
+    # Final pixel-grid scan around the best center.
     cx_best, cy_best, _ = best
     for dy in range(-2, 3):
         for dx in range(-2, 3):
@@ -374,24 +335,17 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
 
     cx_best, cy_best, score_best = best
 
-    # ---- Conservative size adaptation ----------------------------------------
-    # For the ~5 % of dishes that are slightly smaller than fixed_diameter_px,
-    # try progressively smaller diameters. Only accept a smaller one if the edge
-    # score improves by >= CENTER_SHRINK_MIN_GAIN (10 %) — a high bar that leaves
-    # all normally-sized dishes completely untouched.
     d_adapted = d
     for factor in CENTER_SHRINK_CANDIDATES:
         d_try = float(d * factor)
 
-        # Quick pre-check: is this diameter even promising with the current center?
         s_init = edge_score_for_ellipse(
             ((cx_best, cy_best), (d_try, d_try), angle),
             edge_mag, mode=EDGE_SCORE_MODE, n=N_SAMPLES, smooth_k=SMOOTH_K,
         )
         if s_init <= score_best * (1.0 + CENTER_SHRINK_MIN_GAIN):
-            continue  # Not enough gain — try next smaller candidate
+            continue
 
-        # Promising candidate: quick center re-tune for this diameter
         cx_t, cy_t, s_t = cx_best, cy_best, s_init
         for _ in range(CENTER_SHRINK_REFINE_ITERS):
             sxp = edge_score_for_ellipse(((cx_t + 1.0, cy_t), (d_try, d_try), angle), edge_mag, mode=EDGE_SCORE_MODE, n=N_SAMPLES, smooth_k=SMOOTH_K)
@@ -404,62 +358,52 @@ def snap_center_to_edges_fixed_circle(ellipse_init, brightness, fixed_diameter_p
             if s_n > s_t:
                 cx_t, cy_t, s_t = cx_n, cy_n, s_n
 
-        # Final confirmation: must still clear the threshold after re-tuning
         if s_t > score_best * (1.0 + CENTER_SHRINK_MIN_GAIN):
             cx_best, cy_best, score_best = cx_t, cy_t, s_t
             d_adapted = d_try
             print(f"  [size-adapt] d×{factor:.2f} = {d_try:.1f}px accepted (score {s_t:.4f})")
-            break  # take the most conservative (largest) passing candidate; stop here
+            break
 
     ellipse_best = ((float(cx_best), float(cy_best)), (d_adapted, d_adapted), angle)
     return ellipse_best, float(score_best)
 
 
 # ----------------------------
-# Initial ellipse detection (done via contour detection)
+# Initial ellipse detection
 # ----------------------------
 def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
     """
-    Detect an initial ellipse by using multiple thresholding strategies (Otsu's & Canny & HoughCircles) and picking the best valid contour.
+    Estimate the initial dish ellipse from thresholded contours, Canny edges,
+    or a radius-constrained Hough fallback.
     """
     h, w = image_bgr.shape[:2]
     img_area = float(h * w)
 
     def try_with_params(p):
         """
-        Thresholding strategy: 
-        blur -> compute brightness -> Otsu's threshold (binary + inv) -> 
-        contour detection + filtering by area/circularity -> pick best contour -> 
-        convex hull -> fit ellipse, use current parameters. If none is found, use Canny edge-based contours as a fallback.
-        If that doesn't work either use HoughCircles (ONLY AVAILABLE IF FIXED CIRCLE DIAMETER IS KNOWN).
+        Try one blur/closing parameter set and return (ellipse, brightness).
         """
         blurred = cv2.GaussianBlur(image_bgr, (p["blur_ks"], p["blur_ks"]), 0)
 
-        # Standard brightness weights
         brightness = (
             0.299 * blurred[:, :, 2] +
             0.587 * blurred[:, :, 1] +
             0.114 * blurred[:, :, 0]
         ).astype(np.uint8)
 
-        #Kernel for contour cleaning, size from params
         kernel = np.ones((p["close_ks"], p["close_ks"]), np.uint8)
 
         def best_contour_from_thresh(thresh_img):
             """
-             Given a binary thresholded image, find contours via Otsu's thresholding, filter by area and circularity,
-             and return the best valid contour.
-             """
-            # Morph close to clean up noise and connect edges
+            Return the largest contour with plausible dish area and circularity.
+            """
             thresh_img = cv2.morphologyEx(thresh_img, cv2.MORPH_CLOSE, kernel)
-            # Find contours
             contours, _ = cv2.findContours(thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not contours:
                 return None
 
             valid = []
             for cnt in contours:
-                # Filter contours by area
                 area = cv2.contourArea(cnt)
                 if area <= 0:
                     continue
@@ -468,7 +412,6 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
                 if area_frac < 0.30 or area_frac > 0.90:
                     continue
 
-                # Filter contours by circularity (4*pi*area/per^2)
                 per = cv2.arcLength(cnt, True)
                 if per <= 0:
                     continue
@@ -484,7 +427,6 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
 
             return max(valid, key=cv2.contourArea)
 
-        #Threshold brightness using Otsu's method (both binary and inverse) and try to find valid contours
         _, thresh_bin = cv2.threshold(brightness, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         _, thresh_inv = cv2.threshold(brightness, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
@@ -493,15 +435,11 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
 
         chosen = None
         if cnt1 is None and cnt2 is None:
-            # If no valid contour found with Otsu's thresholds, try Canny edge thresholds as a fallback
-
-            # Auto Canny thresholds based on image median
             v = float(np.median(brightness))
             sigma1 = 0.33
             low1 = int(max(0, (1.0 - sigma1) * v))
             high1 = int(min(255, (1.0 + sigma1) * v))
 
-            # A second, slightly different pair of thresholds to increase chances of finding contour
             sigma2 = 0.50
             low2 = int(max(0, (1.0 - sigma2) * v))
             high2 = int(min(255, (1.0 + sigma2) * v))
@@ -509,7 +447,6 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
             edges1 = cv2.Canny(brightness, low1, high1)
             edges2 = cv2.Canny(brightness, low2, high2)
 
-            # Thicken edges so morphology/contours behave more like binary masks
             small = np.ones((3, 3), np.uint8)
             edges1 = cv2.dilate(edges1, small, iterations=1)
             edges2 = cv2.dilate(edges2, small, iterations=1)
@@ -517,24 +454,20 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
             cnt3 = best_contour_from_thresh(edges1)
             cnt4 = best_contour_from_thresh(edges2)
 
-            # Pick the best contour among the two adaptive threshold results if Otsu's method failed
             if cnt3 is None and cnt4 is None:
-                # Third fallback: HoughCircles constrained by expected radius from target area -> ONLY AVAILABLE IF FIXED DIAMETER AVAILABLE
                 expected_r = int(round(float(fixed_diameter_px) * 0.5))
                 r_min = max(5, int(round(0.90 * expected_r)))
                 r_max = max(r_min + 1, int(round(1.10 * expected_r)))
 
-                # Smoothing
                 blur2 = cv2.GaussianBlur(brightness, (9, 9), 1.5)
 
-                # Apply HoughCircles
                 circles = cv2.HoughCircles(
                     blur2,
                     cv2.HOUGH_GRADIENT,
                     dp=1.2,
                     minDist=min(h, w) * 0.25,
-                    param1=120,          # Canny high threshold internally
-                    param2=30,           # accumulator threshold
+                    param1=120,
+                    param2=30,
                     minRadius=r_min,
                     maxRadius=r_max,
                 )
@@ -544,7 +477,6 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
 
                 circles = np.round(circles[0, :]).astype(int)
 
-                # pick the circle closest to image center
                 cx_img = w * 0.5
                 cy_img = h * 0.5
                 best_c = None
@@ -576,21 +508,17 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
         if chosen is None or len(chosen) < 5:
             return None, None
 
-        # Fit ellipse to the convex hull of the chosen contour to get a smoother initial ellipse
         hull = cv2.convexHull(chosen)
         if hull is None or len(hull) < 5:
             return None, None
 
         try:
-            # Fit ellipse
             ellipse = cv2.fitEllipse(hull)
             return ellipse, brightness
         except cv2.error:
             return None, None
 
     for p in PARAM_SETS:
-        # Call function to try ellipse detection with the current set of parameters,
-        # if none of the parameter sets yield a valid ellipse, return None
         ellipse, brightness = try_with_params(p)
         if ellipse is not None:
             return ellipse, brightness, p
@@ -600,7 +528,7 @@ def detect_ellipse_with_thresholding(image_bgr, fixed_diameter_px):
 
 def detect_plate_rgb(image_bgr, fixed_diameter_px):
     """
-    Detect petri dish, mask everything outside (with border erosion).
+    Detect the dish, erode the rim, and black out everything outside it.
     """
     h, w = image_bgr.shape[:2]
 
@@ -619,7 +547,6 @@ def detect_plate_rgb(image_bgr, fixed_diameter_px):
     print(f"circle: cx={cx:.1f} cy={cy:.1f} d={d1:.1f} "
           f"area={area:.0f} edge={edge_score:.4f}")
 
-    # ── NEW: eroded mask keeps the dish rim out ──
     mask = make_eroded_ellipse_mask((h, w), ellipse_final, BORDER_EROSION_PX)
     masked = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
 
@@ -629,13 +556,11 @@ def detect_plate_rgb(image_bgr, fixed_diameter_px):
 # ----------------------------
 def derive_top_bottom_filenames(original_filename: str):
     """
-    Derive top and bottom dish filenames from the original filename.
-    Example:
-      DIFIP1_473Ndilu0_475Ndilu0.tif -> (DIFIP1_473Ndilu0.tif, DIFIP1_475Ndilu0.tif)
-    Rule:
-      prefix_B_C.ext -> top=prefix_B.ext, bottom=prefix_C.ext  (uses last two underscore tokens)
-    Fallback:
-      <stem>_top.ext and <stem>_bottom.ext
+    Derive output names for a possible paired top/bottom input.
+
+    Example: DIFIP1_473Ndilu0_475Ndilu0.tif becomes
+    DIFIP1_473Ndilu0.tif and DIFIP1_475Ndilu0.tif. Single-name inputs keep the
+    original name and return no bottom output.
     """
     base = os.path.basename(original_filename)
     stem, ext = os.path.splitext(base)
@@ -645,33 +570,32 @@ def derive_top_bottom_filenames(original_filename: str):
         prefix = "_".join(parts[:-2])
         b = parts[-2]
         c = parts[-1]
-        top = f"{prefix}_{b}{ext}"
-        bottom = f"{prefix}_{c}{ext}"
-        return top, bottom
+        if re.search(r"dilu\d+", b, re.IGNORECASE) and re.search(r"dilu\d+", c, re.IGNORECASE):
+            top = f"{prefix}_{b}{ext}"
+            bottom = f"{prefix}_{c}{ext}"
+            return top, bottom
 
-    # fallback
-    return f"{stem}_top{ext}", f"{stem}_bottom{ext}"
+    return f"{stem}{ext}", None
 
 
 def find_divider_y(brightness, ellipse_final, bar_q=10, frac_thresh=0.35,
                    min_thick=20, max_thick=120):
     """
-    Search for a horizontal black divider inside the ellipse.
-    Returns y_split (int) or None if not found.
+    Find a horizontal dark divider run inside the dish ellipse.
+
+    Returns (y_top, y_bottom) for the selected run, or None if no plausible
+    divider is found.
     """
     h, w = brightness.shape[:2]
 
-    # ellipse mask
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.ellipse(mask, ellipse_final, 255, -1)
     inside = mask.astype(bool)
 
-    # row-wise low-percentile statistic inside the dish
-    row_stat = np.full(h, np.nan, dtype=np.float32)
-    for y in range(h):
-        m = inside[y]
-        if np.any(m):
-            row_stat[y] = np.percentile(brightness[y, m], bar_q)
+    masked_brightness = np.where(inside, brightness.astype(np.float32), np.nan)
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.filterwarnings("ignore", "All-NaN slice encountered", RuntimeWarning)
+        row_stat = np.nanpercentile(masked_brightness, bar_q, axis=1).astype(np.float32)
 
     valid = ~np.isnan(row_stat)
     if not np.any(valid):
@@ -682,7 +606,6 @@ def find_divider_y(brightness, ellipse_final, bar_q=10, frac_thresh=0.35,
 
     is_bar = valid & (row_stat < thr)
 
-    # Collect contiguous dark runs that look like divider candidates.
     runs = []
     start = None
     for i, v in enumerate(is_bar):
@@ -703,10 +626,6 @@ def find_divider_y(brightness, ellipse_final, bar_q=10, frac_thresh=0.35,
     if not runs:
         return None
 
-    # Score each run by:
-    # 1) darkness (divider should be dark),
-    # 2) thickness sanity,
-    # 3) top/bottom area balance inside ellipse (halves often similar size).
     inside_counts = inside.sum(axis=1).astype(np.float32)
     csum = np.cumsum(inside_counts)
     total_inside = float(csum[-1]) if csum.size else 0.0
@@ -720,27 +639,19 @@ def find_divider_y(brightness, ellipse_final, bar_q=10, frac_thresh=0.35,
             return float(csum[-1])
         return float(csum[y_end_inclusive])
 
-    # For darkness normalization; guards divide-by-zero if thr becomes very small.
     denom_dark = max(1e-6, thr)
 
     best_score = None
     best_run = None
     for y0, y1, length in runs:
-        y_split = int(round(0.5 * (y0 + y1)))
-
         top_area = prefix_sum(y0 - 1)
         bottom_area = total_inside - prefix_sum(y1)
         if top_area <= 0.0 or bottom_area <= 0.0:
             continue
 
-        # 0..1 (1 = perfectly balanced).
         balance = min(top_area, bottom_area) / (max(top_area, bottom_area) + 1e-6)
-
-        # Darker rows -> larger score.
         run_dark = float(np.nanmean(row_stat[y0:y1 + 1]))
         darkness = max(0.0, (thr - run_dark) / denom_dark)
-
-        # Prefer runs near expected thickness scale to suppress tiny flicker bars.
         thick_score = min(1.0, float(length) / max(1.0, float(min_thick)))
 
         score = darkness + (BAR_BALANCE_WEIGHT * balance) + (0.25 * thick_score)
@@ -749,7 +660,6 @@ def find_divider_y(brightness, ellipse_final, bar_q=10, frac_thresh=0.35,
             best_run = (y0, y1)
 
     if best_run is None:
-        # Fallback: keep old behavior if scoring could not evaluate candidates.
         y0, y1, _ = max(runs, key=lambda r: r[2])
     else:
         y0, y1 = best_run
@@ -759,22 +669,18 @@ def find_divider_y(brightness, ellipse_final, bar_q=10, frac_thresh=0.35,
 
 def find_divider_y_balance_fallback(brightness, ellipse_final, bar_q=BAR_Q):
     """
-    Fallback divider search:
-    scan y around ellipse center and score candidates by
-    1) top/bottom area balance and
-    2) darkness on the divider row.
+    Fallback divider search using area balance and row darkness near center.
     """
     h, w = brightness.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.ellipse(mask, ellipse_final, 255, -1)
     inside = mask.astype(bool)
 
-    row_stat = np.full(h, np.nan, dtype=np.float32)
     row_cnt = inside.sum(axis=1).astype(np.float32)
-    for y in range(h):
-        m = inside[y]
-        if np.any(m):
-            row_stat[y] = np.percentile(brightness[y, m], bar_q)
+    masked_brightness = np.where(inside, brightness.astype(np.float32), np.nan)
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.filterwarnings("ignore", "All-NaN slice encountered", RuntimeWarning)
+        row_stat = np.nanpercentile(masked_brightness, bar_q, axis=1).astype(np.float32)
 
     valid_rows = np.where((~np.isnan(row_stat)) & (row_cnt > 0))[0]
     if valid_rows.size == 0:
@@ -830,44 +736,6 @@ def looks_like_double_name(filename: str) -> bool:
     return bool(re.search(r"dilu\d+$", parts[-1], re.IGNORECASE) and re.search(r"dilu\d+$", parts[-2], re.IGNORECASE))
 
 
-def split_balance_only_y(image_shape, ellipse_final):
-    """
-    Always-return fallback split based purely on top/bottom area balance inside ellipse.
-    Returns y or None.
-    """
-    h, w = image_shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.ellipse(mask, ellipse_final, 255, -1)
-    inside_counts = (mask > 0).sum(axis=1).astype(np.float32)
-    csum = np.cumsum(inside_counts)
-    if csum.size == 0 or float(csum[-1]) <= 1e-6:
-        return None
-
-    total = float(csum[-1])
-    cy = int(round(float(ellipse_final[0][1])))
-    band_half = max(30, int(0.45 * float(ellipse_final[1][1])))
-    y_lo = max(1, cy - band_half)
-    y_hi = min(h - 2, cy + band_half)
-    if y_lo >= y_hi:
-        y_lo, y_hi = 1, h - 2
-
-    best_y = None
-    best_balance = -1.0
-    for y in range(y_lo, y_hi + 1):
-        top_area = float(csum[y - 1]) if y > 0 else 0.0
-        bottom_area = total - float(csum[y])
-        if top_area <= 0.0 or bottom_area <= 0.0:
-            continue
-        balance = min(top_area, bottom_area) / (max(top_area, bottom_area) + 1e-6)
-        if balance > best_balance:
-            best_balance = balance
-            best_y = y
-
-    if best_y is None:
-        return None
-    return int(best_y), int(best_y)
-
-
 def _line_balance_score(h: int, w: int, ellipse, p1, p2):
     """
     Compute top/bottom area balance for a near-horizontal divider line.
@@ -898,7 +766,8 @@ def _line_balance_score(h: int, w: int, ellipse, p1, p2):
 
 def find_divider_line_dark(brightness, ellipse_final):
     """
-    Detect dominant dark divider line in dish center.
+    Detect a near-horizontal dark divider line in the dish center.
+
     Returns (p1, p2, score) or None.
     """
     h, w = brightness.shape[:2]
@@ -967,6 +836,9 @@ def mask_top_bottom_from_line(image_bgr, ellipse, p1, p2,
                                gap=BAR_SPLIT_MARGIN_PX,
                                bar_half_width=BAR_MAX_THICK_PX // 2,
                                brightness=None):
+    """
+    Split the dish using a detected divider line and remove a band around it.
+    """
     h, w = image_bgr.shape[:2]
     x1, y1 = float(p1[0]), float(p1[1])
     x2, y2 = float(p2[0]), float(p2[1])
@@ -977,7 +849,6 @@ def mask_top_bottom_from_line(image_bgr, ellipse, p1, p2,
     m = (y2 - y1) / dx
     b = y1 - m * x1
 
-    # ── Eroded dish mask ──
     dish_mask = make_eroded_ellipse_mask((h, w), ellipse, BORDER_EROSION_PX)
     dish = dish_mask > 0
 
@@ -994,7 +865,6 @@ def mask_top_bottom_from_line(image_bgr, ellipse, p1, p2,
     masked_top    = cv2.bitwise_and(image_bgr, image_bgr, mask=top_mask)
     masked_bottom = cv2.bitwise_and(image_bgr, image_bgr, mask=bottom_mask)
 
-    # ── Post-cleanup ──
     if brightness is not None:
         masked_top    = cleanup_bar_remnants(
             masked_top, brightness, ellipse, seam_side="bottom")
@@ -1007,21 +877,20 @@ def mask_top_bottom_from_line(image_bgr, ellipse, p1, p2,
 def mask_top_bottom(image_bgr, ellipse, y_bar_top, y_bar_bot,
                     margin=BAR_SPLIT_MARGIN_PX, brightness=None):
     """
-    Split the dish into top/bottom halves.
-    • Uses an ADAPTIVE margin derived from the actual bar thickness.
-    • Applies BORDER_EROSION_PX so the rim is excluded.
-    • Runs cleanup_bar_remnants() on each half to scrub leftover dark rows.
+    Split the dish into top/bottom halves from a horizontal divider run.
+
+    The removed seam band grows with the detected bar thickness, the dish rim
+    is eroded out, and optional brightness-based cleanup removes leftover dark
+    seam pixels.
     """
     h, w = image_bgr.shape[:2]
 
-    # ── Adaptive margin: widen proportionally to bar thickness ──
     bar_thickness = max(1, y_bar_bot - y_bar_top)
     adaptive_margin = max(
         margin,
         int(round(bar_thickness * BAR_ADAPTIVE_MARGIN_MULT * 0.5)),
     )
 
-    # ── Eroded dish mask (no rim) ──
     dish_mask = make_eroded_ellipse_mask((h, w), ellipse, BORDER_EROSION_PX)
 
     y_black_start = max(0, y_bar_top - adaptive_margin)
@@ -1036,7 +905,6 @@ def mask_top_bottom(image_bgr, ellipse, y_bar_top, y_bar_bot,
     masked_top    = cv2.bitwise_and(image_bgr, image_bgr, mask=top_mask)
     masked_bottom = cv2.bitwise_and(image_bgr, image_bgr, mask=bottom_mask)
 
-    # ── Post-cleanup: scrub any leftover dark bar rows near the seam ──
     if brightness is not None:
         masked_top    = cleanup_bar_remnants(
             masked_top, brightness, ellipse, seam_side="bottom")
@@ -1052,7 +920,7 @@ def mask_top_bottom(image_bgr, ellipse, y_bar_top, y_bar_bot,
 
 def list_images(input_dir: str):
     """
-    Helper function to list all image files in the input directory with specified extensions.
+    Return supported image files under input_dir.
     """
     all_files = glob.glob(os.path.join(input_dir, "**", "*"), recursive=True)
     return [f for f in all_files if f.lower().endswith(IMAGE_EXTENSIONS)]
@@ -1060,9 +928,8 @@ def list_images(input_dir: str):
 
 def main():
     """
-    Main function to parse arguments, process images in the input directory, detect petri dishes, mask them, and save results.
+    Parse CLI arguments, detect/mask dishes, optionally split pairs, and save outputs.
     """
-    # Argument parsing
     ap = argparse.ArgumentParser(description="Detect petri dish and mask images.")
     ap.add_argument("--input_dir", required=True, help="Input folder containing images.")
     ap.add_argument("--out_dir", required=True, help="Output folder for masked images.")
@@ -1074,12 +941,10 @@ def main():
                     help="Split mode: auto | yes | no. auto decides per image.")
     args = ap.parse_args()
 
-    # Input/output directory setup
     input_dir = os.path.expanduser(args.input_dir)
     out_dir = os.path.expanduser(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Derive fixed circle diameter from target area
     target_area = float(args.target_area_px2)
     fixed_diameter_px = 2.0 * np.sqrt(target_area / np.pi)
 
@@ -1092,12 +957,10 @@ def main():
         split_mode = "auto"
     split_halves = split_mode != "no"
 
-    # Parse image paths from input directory, optionally limit to max_images
     image_paths = list_images(input_dir)
     if args.max_images is not None and args.max_images > 0:
         image_paths = image_paths[:args.max_images]
 
-    # Print summary of settings and number of images to process
     print(f"Input:  {input_dir}")
     print(f"Output: {out_dir}")
     print(f"Found {len(image_paths)} images to process.")
@@ -1111,7 +974,6 @@ def main():
     removed_stale_unsplit = 0
     line_split_count = 0
 
-    # Process each image: detect petri dish, mask, and save result
     for i, path in enumerate(image_paths, 1):
         print(f"[{i}] Processing: {path}")
         image = cv2.imread(path)
@@ -1119,26 +981,21 @@ def main():
             print("Could not load image.")
             continue
 
-        # Detect petri dish, mask, and get used parameters
         masked, ellipse_final, brightness, used_params = detect_plate_rgb(image, fixed_diameter_px=fixed_diameter_px)
 
-        # If no ellipse (dish) detected, count and skip saving
         if ellipse_final is None:
             no_contour_count += 1
             continue
 
-        # If the used parameters for initial ellipse detection are not the first/default set, count it as a fallback usage
         if used_params != PARAM_SETS[0]:
             used_fallback_count += 1
 
-        # If halves are used, after fitting ellipse: Search for black bar in Ellipse.
         if split_halves:
             base_name = os.path.basename(path)
             is_pair_name = looks_like_double_name(base_name)
             split_this = (split_mode == "yes") or (split_mode == "auto" and is_pair_name)
             split_result = None
 
-            # Dominant dark-line detector (handles small tilt without forcing all images).
             line_candidate = find_divider_line_dark(brightness, ellipse_final)
             if line_candidate is not None:
                 p1, p2, line_score = line_candidate
@@ -1167,7 +1024,6 @@ def main():
                     max_thick=BAR_MAX_THICK_PX,
                 )
 
-            # Relaxed pass for hard cases.
             if split_result is None and split_this and bar_extents is None:
                 bar_extents = find_divider_y(
                     brightness,
@@ -1178,36 +1034,8 @@ def main():
                     max_thick=BAR_RELAXED_MAX_THICK,
                 )
 
-            # Final fallback: choose y by area-balance + row darkness score.
             if split_result is None and split_this and bar_extents is None:
                 bar_extents = find_divider_y_balance_fallback(brightness, ellipse_final, bar_q=BAR_Q)
-
-            # If still not found but filename strongly indicates two dishes,
-            # force split by geometric area balance.
-            if split_result is None and split_this and bar_extents is None and is_pair_name:
-                bar_extents = split_balance_only_y(brightness.shape[:2], ellipse_final)
-                if bar_extents is not None:
-                    y_ctr = (bar_extents[0] + bar_extents[1]) // 2
-                    print(f"[INFO] Forced split by area-balance for pair-like file: {base_name} at y={y_ctr}")
-
-            # When a line-based split is already prepared, refine its gap using the
-            # row-stat bar extent if available.
-            if split_result is not None and bar_extents is not None:
-                y0_bar, y1_bar = bar_extents
-                bar_half = max(BAR_SPLIT_MARGIN_PX, (y1_bar - y0_bar) // 2 + BAR_SPLIT_MARGIN_PX)
-                p1_line, p2_line = (line_candidate[0], line_candidate[1]) if line_candidate is not None else (None, None)
-                if p1_line is not None:
-                    refined = mask_top_bottom_from_line(
-                        image_bgr=image,
-                        ellipse=ellipse_final,
-                        p1=p1_line,
-                        p2=p2_line,
-                        gap=BAR_SPLIT_MARGIN_PX,
-                        bar_half_width=bar_half,
-                        brightness=brightness, 
-                    )
-                    if refined is not None:
-                        split_result = refined
 
             if split_result is None and split_this and bar_extents is not None:
                 y0_bar, y1_bar = bar_extents
@@ -1225,12 +1053,12 @@ def main():
                 top_name, bottom_name = derive_top_bottom_filenames(os.path.basename(path))
 
                 save_path_top = os.path.join(out_dir, top_name)
-                save_path_bottom = os.path.join(out_dir, bottom_name)
 
                 cv2.imwrite(save_path_top, masked_top)
-                cv2.imwrite(save_path_bottom, masked_bottom)
+                if bottom_name is not None:
+                    save_path_bottom = os.path.join(out_dir, bottom_name)
+                    cv2.imwrite(save_path_bottom, masked_bottom)
 
-                # Cleanup stale unsplit file from older runs, if present.
                 original_name = os.path.basename(path)
                 if looks_like_double_name(original_name):
                     stale_path = os.path.join(out_dir, original_name)
@@ -1242,7 +1070,6 @@ def main():
                             print(f"[WARN] Could not remove stale unsplit file: {stale_path}")
                 continue
 
-        # Save image (normal single-mask case)
         filename = os.path.basename(path)
         save_path = os.path.join(out_dir, filename)
         cv2.imwrite(save_path, masked)
@@ -1250,7 +1077,6 @@ def main():
             unsplit_pair_name_count += 1
             unsplit_pair_files_run.append(filename)
 
-    # Final Summary of results
     total = len(image_paths)
     print("\nDone.")
     print(f"No contour detected in {no_contour_count} out of {total} images.")
@@ -1271,10 +1097,11 @@ def main():
         out_files = list_images(out_dir)
         double_name_files = [os.path.basename(p) for p in out_files if looks_like_double_name(p)]
 
-        # Final stale cleanup pass: if split outputs already exist, remove pair-like original.
         removed_stale_post = 0
         for fn in double_name_files:
             top_name, bottom_name = derive_top_bottom_filenames(fn)
+            if bottom_name is None:
+                continue
             p_top = os.path.join(out_dir, top_name)
             p_bottom = os.path.join(out_dir, bottom_name)
             p_orig = os.path.join(out_dir, fn)
@@ -1290,8 +1117,6 @@ def main():
             out_files = list_images(out_dir)
             double_name_files = [os.path.basename(p) for p in out_files if looks_like_double_name(p)]
 
-        # If current run had zero unsplit pair-like files, any remaining pair-like outputs
-        # are stale leftovers from older runs. Purge them so out_dir reflects current run.
         purged_leftovers = 0
         if unsplit_pair_name_count == 0 and double_name_files:
             for fn in list(double_name_files):
@@ -1314,6 +1139,5 @@ def main():
                 preview += ", ..."
             print(f"[WARN] Unsplit-like files: {preview}")
 
-# Call main function
 if __name__ == "__main__":
     main()

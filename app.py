@@ -45,7 +45,7 @@ import numpy as np
 import cv2
 from dataclasses import dataclass, field
 import copy
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QRect, QRectF, QPoint, QTimer, QModelIndex
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QRect, QRectF, QPoint, QTimer, QModelIndex, QSettings
 from PySide6.QtGui import QPixmap, QImage, QFont, QPalette, QColor, QCursor, QPen, QIcon, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
@@ -61,12 +61,18 @@ from PySide6.QtWidgets import QCheckBox
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 VERSION_FOLDER = ""  # keep as in your code
 GT_TOKEN_RE = re.compile(r"^([A-Za-z0-9]+)dilu(?:e)?(\d+)$", re.IGNORECASE)
-ORCD_HOST_DEFAULT = "orcd-login.mit.edu"
-ORCD_PORT_DEFAULT = 22
-ORCD_CPSAM_ROOT = "/home/juweiss/UROP/CPSAM"
-ORCD_IMAGES_APP_DIR = f"{ORCD_CPSAM_ROOT}/Images_App"
-ORCD_OUTPUT_APP_DIR = f"{ORCD_CPSAM_ROOT}/Output_App"
-ORCD_MUX_SOCKET = "~/.ssh/orcd_mux"
+
+# ── Direct GPU server defaults (all values are editable in the dialog UI) ────
+GPU_HOST_DEFAULT   = "100.126.92.100"          # Tailscale IP of the GPU machine
+GPU_PORT_DEFAULT   = 22
+GPU_KEY_DEFAULT    = "~/.ssh/gpu_server_key"   # SSH private key (no passphrase)
+GPU_USER_DEFAULT   = "justin"                  # username on the GPU machine
+GPU_CPSAM_ROOT     = "/home/justin/Documents/pretrained"   # folder containing CPSAM.py
+GPU_CONDA_ENV      = "cellpose"
+GPU_CPSAM_SCRIPT   = "CPSAM.py"
+GPU_CPSAM_MODEL    = "/home/justin/Documents/pretrained/cpsam_finetuned.zip"
+# ─────────────────────────────────────────────────────────────────────────────
+
 LIGHT_COMBO_ARROW_PATH = (Path(__file__).resolve().parent / "ui_assets" / "combo_arrow_dark.svg").as_posix()
 SHARED_SLIDER_QSS = """
 QSlider {
@@ -703,7 +709,11 @@ def stitch_mask_side_by_side(left: np.ndarray, right: np.ndarray, gap: int = 12)
 
 def make_output_ids_for_image(img_path: str) -> Tuple[str, str]:
     stem = Path(img_path).stem
-    return f"{stem}_Top", f"{stem}_Bottom"
+    parts = stem.split("_")
+    if len(parts) >= 3 and re.search(r"dilu\d+", parts[-2], re.IGNORECASE) and re.search(r"dilu\d+", parts[-1], re.IGNORECASE):
+        prefix = "_".join(parts[:-2])
+        return f"{prefix}_{parts[-2]}", f"{prefix}_{parts[-1]}"
+    return stem, ""
 
 
 # ----------------------------
@@ -1148,6 +1158,7 @@ class ResultRow:
     masked_green_initialized: bool = False
     user_modified_mask: bool = False
     current_count: Optional[int] = None
+    cpsam_count: Optional[int] = None
 
     pp_original: PostprocessState = field(default_factory=PostprocessState)
     pp_masked: PostprocessState = field(default_factory=PostprocessState)
@@ -1199,7 +1210,6 @@ class ProcessImagesTask(QRunnable):
 
                 tif_paths = list(result_meta.get("out_paths", [])) if isinstance(result_meta, dict) else []
                 algorithm_counts = [int(v) for v in result_meta.get("counts", [])] if isinstance(result_meta, dict) else []
-                tif_paths.sort(key=lambda p: (("_Bottom" in Path(p).stem), Path(p).name.lower()))
 
                 expt_paths = [p for p in tif_paths if "__expt" in Path(p).stem.lower()]
                 post_mask_paths = [p for p in tif_paths if "__post" in Path(p).stem.lower()]
@@ -1232,7 +1242,277 @@ class SSHJobSignals(QObject):
     error = Signal(str)
 
 
-class SSHCPSAMTask(QRunnable):
+class _SetupSignals(QObject):
+    """Signals for the background SSH key-setup runnable."""
+    log_msg  = Signal(str)
+    finished = Signal(bool, str)   # (success, error_message)
+
+
+class _SetupRunnable(QRunnable):
+    """Runs SSH key generation + installation + verification in a worker thread.
+
+    All blocking I/O (paramiko, subprocess) happens here; results are
+    communicated back to the wizard via signals — no processEvents() needed.
+
+    IMPORTANT: `signals` must be created and owned by the caller (main thread).
+    The runnable only borrows the reference.  If the runnable owned the QObject
+    itself, Qt's thread pool would destroy it from the worker thread after run()
+    returns, which races with queued signal delivery on the main thread → SIGSEGV.
+    """
+
+    def __init__(self, host: str, port: int, username: str,
+                 password: str, key_path: "Path",
+                 signals: "_SetupSignals"):
+        super().__init__()
+        self.host     = host
+        self.port     = port
+        self.username = username
+        self.password = password
+        self.key_path = key_path
+        self.signals  = signals   # borrowed — caller must keep alive
+
+    def run(self):
+        try:
+            import paramiko
+        except ImportError:
+            self.signals.finished.emit(
+                False,
+                "paramiko is not installed.\n\n"
+                "Install it with:\n  pip install paramiko\n"
+                "or add it to environment.yml and recreate the conda env."
+            )
+            return
+
+        try:
+            # ── Step 1: generate SSH key if absent ────────────────────────
+            self.signals.log_msg.emit("[ 1 / 3 ]  Checking SSH key ...")
+            self.key_path.parent.mkdir(parents=True, exist_ok=True)
+            pub_path = Path(str(self.key_path) + ".pub")
+
+            if not self.key_path.exists():
+                self.signals.log_msg.emit("  Generating new ed25519 key ...")
+                r = subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-f", str(self.key_path), "-N", ""],
+                    capture_output=True, text=True,
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(f"ssh-keygen failed:\n{r.stderr}")
+                self.signals.log_msg.emit("  ✓ Key generated")
+            else:
+                self.signals.log_msg.emit("  ✓ Key already exists — reusing it")
+
+            pubkey = pub_path.read_text().strip()
+
+            # ── Step 2: install key on GPU machine via password auth ──────
+            self.signals.log_msg.emit(
+                f"\n[ 2 / 3 ]  Connecting to {self.username}@{self.host} with password ..."
+            )
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                client.connect(
+                    hostname=self.host, port=self.port,
+                    username=self.username, password=self.password,
+                    timeout=20, allow_agent=False, look_for_keys=False,
+                )
+            except paramiko.AuthenticationException:
+                raise RuntimeError(
+                    "Password incorrect or password login is disabled on the GPU machine.\n"
+                    "Check the username and password and try again."
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not reach {self.host}:{self.port} — {e}\n\n"
+                    "Make sure Tailscale is running on both machines and the "
+                    "GPU machine's IP is correct."
+                )
+
+            self.signals.log_msg.emit("  ✓ Connected with password")
+            self.signals.log_msg.emit("  Installing key in ~/.ssh/authorized_keys ...")
+
+            # Idempotent: append key only if not already present
+            install_cmd = (
+                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+                f"grep -qxF {shlex.quote(pubkey)} ~/.ssh/authorized_keys 2>/dev/null "
+                f"|| echo {shlex.quote(pubkey)} >> ~/.ssh/authorized_keys && "
+                "chmod 600 ~/.ssh/authorized_keys"
+            )
+            _, stdout, stderr = client.exec_command(install_cmd)
+            exit_code = stdout.channel.recv_exit_status()
+            client.close()
+
+            if exit_code != 0:
+                err = stderr.read().decode().strip()
+                raise RuntimeError(f"Key installation failed (exit {exit_code}):\n{err}")
+            self.signals.log_msg.emit("  ✓ Key installed")
+
+            # ── Step 3: verify key-only login works ───────────────────────
+            self.signals.log_msg.emit("\n[ 3 / 3 ]  Verifying key login (no password) ...")
+            client2 = paramiko.SSHClient()
+            client2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client2.connect(
+                hostname=self.host, port=self.port,
+                username=self.username,
+                key_filename=str(self.key_path),
+                timeout=15, allow_agent=False, look_for_keys=False,
+            )
+            _, out2, _ = client2.exec_command("echo cara_ok")
+            got = out2.read().decode().strip()
+            client2.close()
+
+            if got != "cara_ok":
+                raise RuntimeError(
+                    f"Key login test failed (got {got!r} instead of 'cara_ok')."
+                )
+            self.signals.log_msg.emit("  ✓ Key login works perfectly")
+            self.signals.log_msg.emit("\n✓ Setup complete!  The app will now connect automatically.")
+            self.signals.finished.emit(True, "")
+
+        except Exception as exc:
+            self.signals.finished.emit(False, str(exc))
+
+
+class GPUSetupWizard(QDialog):
+    """First-time setup wizard for the GPU server connection.
+
+    Uses the user's password exactly once (via paramiko) to install an SSH key.
+    After that, the app connects automatically — no password, no terminal needed.
+    Works on any laptop: just run the app, enter the password once, done.
+    """
+
+    def __init__(self, parent, host: str, port: int, username: str, key_path: "Path"):
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+        self.username = username
+        self.key_path = Path(key_path).expanduser()
+        self.setup_ok = False
+
+        self.setWindowTitle("GPU Server — First-Time Setup")
+        self.resize(580, 460)
+        self.setModal(True)
+
+        lay = QVBoxLayout(self)
+
+        intro = QLabel(
+            "<b>One-time setup</b> — takes about 10 seconds.<br><br>"
+            "The app will generate a secure SSH key and install it on your GPU "
+            "machine using your password. After this, no password is ever needed "
+            "again — the app connects automatically from any laptop."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        lay.addWidget(intro)
+
+        form = QGridLayout()
+        form.setColumnMinimumWidth(0, 130)
+        self.host_edit = QLineEdit(host)
+        self.user_edit = QLineEdit(username)
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.pass_edit.setPlaceholderText("Your password on the GPU machine")
+        self.pass_edit.returnPressed.connect(self._run_setup)
+        form.addWidget(QLabel("Host / Tailscale IP"), 0, 0)
+        form.addWidget(self.host_edit, 0, 1)
+        form.addWidget(QLabel("Username"), 1, 0)
+        form.addWidget(self.user_edit, 1, 1)
+        form.addWidget(QLabel("Password (used once)"), 2, 0)
+        form.addWidget(self.pass_edit, 2, 1)
+        note = QLabel("Password is used only to install the key and is never stored.")
+        note.setStyleSheet("color: #9aa0a6; font-size: 11px;")
+        form.addWidget(note, 3, 1)
+        lay.addLayout(form)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(200)
+        self.log.setFixedHeight(140)
+        lay.addWidget(self.log)
+
+        btn_row = QWidget()
+        blay = QHBoxLayout(btn_row)
+        blay.setContentsMargins(0, 0, 0, 0)
+        self.btn_setup = QPushButton("Connect && Set Up")
+        self.btn_setup.setProperty("primary", True)
+        btn_cancel = QPushButton("Cancel")
+        blay.addWidget(self.btn_setup)
+        blay.addStretch(1)
+        blay.addWidget(btn_cancel)
+        lay.addWidget(btn_row)
+
+        self.btn_setup.clicked.connect(self._run_setup)
+        btn_cancel.clicked.connect(self.reject)
+
+    # ── slots (always called from the GUI thread via Qt signal delivery) ─────
+
+    def _append_log(self, msg: str):
+        """Slot — appends a line to the log widget. Called via signal, never directly."""
+        self.log.appendPlainText(msg)
+
+    def _on_setup_finished(self, success: bool, error_msg: str):
+        """Slot — called when the background runnable finishes."""
+        if success:
+            _s = QSettings("CARA", "CPSAMGPUServer")
+            _s.setValue("gpu_host",   self.host_edit.text().strip())
+            _s.setValue("gpu_user",   self.user_edit.text().strip())
+            _s.setValue("gpu_key",    str(self.key_path))
+            _s.setValue("setup_done", "1")
+            _s.sync()
+
+            self.setup_ok = True
+            self.btn_setup.setText("Done — Close")
+            self.btn_setup.setEnabled(True)
+            self.btn_setup.clicked.disconnect()
+            self.btn_setup.clicked.connect(self.accept)
+        else:
+            self.log.appendPlainText(f"\n✗  {error_msg}")
+            self.btn_setup.setEnabled(True)
+
+    # ── kick off background setup ─────────────────────────────────────────────
+
+    def _run_setup(self):
+        host     = self.host_edit.text().strip()
+        username = self.user_edit.text().strip()
+        password = self.pass_edit.text()
+
+        if not host or not username:
+            QMessageBox.warning(self, "Missing fields",
+                                "Please enter Host and Username.")
+            return
+        if not password:
+            QMessageBox.warning(self, "Password required",
+                                "Enter the GPU machine password to install the key.")
+            return
+
+        self.btn_setup.setEnabled(False)
+        self.log.clear()
+
+        # Create the signals object HERE (main thread) and keep it as an instance
+        # attribute so this wizard object holds the only strong reference.
+        # The runnable only borrows it — when the thread pool destroys the
+        # QRunnableWrapper after run() returns, it decrefs the runnable but the
+        # signals QObject stays alive because self._signals still holds it.
+        self._signals = _SetupSignals()
+        runnable = _SetupRunnable(
+            host=host, port=self.port, username=username,
+            password=password, key_path=self.key_path,
+            signals=self._signals,
+        )
+        self._signals.log_msg.connect(self._append_log)
+        self._signals.finished.connect(self._on_setup_finished)
+        QThreadPool.globalInstance().start(runnable)
+
+
+class DirectSSHCPSAMTask(QRunnable):
+    """Upload images to a GPU machine via SSH key auth, run CPSAM directly
+    (no SLURM / no sbatch), download results, then delete all remote temp files.
+
+    Auth uses an SSH private key — no password, no Duo, no ControlMaster socket.
+    One-time setup in Terminal:
+        ssh-keygen -t ed25519 -f ~/.ssh/gpu_server_key
+        ssh-copy-id -i ~/.ssh/gpu_server_key.pub username@<tailscale-ip>
+    """
+
     def __init__(
         self,
         image_paths: List[str],
@@ -1240,10 +1520,13 @@ class SSHCPSAMTask(QRunnable):
         host: str,
         port: int,
         username: str,
-        password: str,
-        use_existing_images_app: bool,
-        cleanup_uploaded_inputs: bool,
-        mux_socket: str,
+        key_file: str,
+        remote_root: str,      # folder containing the CPSAM script on the GPU machine
+        conda_env: str,
+        cpsam_script: str,     # filename of the CPSAM script, e.g. "CPSAM.py"
+        cpsam_model: str,      # path to model dir (relative to remote_root or absolute)
+        signals: "SSHJobSignals",
+        cleanup_remote: bool = True,
     ):
         super().__init__()
         self.image_paths = image_paths
@@ -1251,215 +1534,186 @@ class SSHCPSAMTask(QRunnable):
         self.host = host
         self.port = int(port)
         self.username = username
-        self.password = password
-        self.use_existing_images_app = bool(use_existing_images_app)
-        self.cleanup_uploaded_inputs = bool(cleanup_uploaded_inputs)
-        self.mux_socket = mux_socket
-        self.signals = SSHJobSignals()
+        self.key_file = str(Path(key_file).expanduser())
+        self.remote_root = remote_root.rstrip("/")
+        self.conda_env = conda_env
+        self.cpsam_script = cpsam_script
+        self.cpsam_model = cpsam_model
+        self.cleanup_remote = bool(cleanup_remote)
+        self.signals = signals   # borrowed — caller (main thread) must keep alive
+
+    # ── SSH / SCP helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def _run_local(cmd: List[str]) -> Tuple[int, str, str]:
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        out = p.stdout or ""
-        err = p.stderr or ""
-        return p.returncode, out, err
+    def _run_local(cmd: List[str], timeout: Optional[int] = None) -> Tuple[int, str, str]:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout or "", p.stderr or ""
 
-    def _ssh(self, remote_cmd: str) -> Tuple[int, str, str]:
-        target = f"{self.username}@{self.host}"
+    def _common_ssh_opts(self) -> List[str]:
+        """Options shared between ssh and scp calls."""
+        return [
+            "-i", self.key_file,
+            "-o", "BatchMode=yes",                    # fail immediately if key rejected
+            "-o", "StrictHostKeyChecking=accept-new", # auto-accept on first connect
+            "-o", "ConnectTimeout=15",
+        ]
+
+    def _ssh(self, remote_cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
         cmd = [
             "ssh",
             "-p", str(self.port),
-            "-S", self.mux_socket,
-            "-o", "ControlMaster=no",
-            target,
+            *self._common_ssh_opts(),
+            f"{self.username}@{self.host}",
             remote_cmd,
         ]
-        return self._run_local(cmd)
+        return self._run_local(cmd, timeout=timeout)
 
-    def _scp_upload(self, local_path: str, remote_dir: str) -> Tuple[int, str, str]:
-        target = f"{self.username}@{self.host}:{remote_dir.rstrip('/')}/"
+    def _scp_up(self, local_path: str, remote_dir: str) -> Tuple[int, str, str]:
         cmd = [
             "scp",
-            "-P", str(self.port),
-            "-o", f"ControlPath={self.mux_socket}",
-            "-o", "ControlMaster=no",
+            "-P", str(self.port),        # scp uses capital -P for port
+            *self._common_ssh_opts(),
             local_path,
-            target,
+            f"{self.username}@{self.host}:{remote_dir.rstrip('/')}/",
         ]
         return self._run_local(cmd)
 
-    def _scp_download(self, remote_file: str, local_file: str) -> Tuple[int, str, str]:
-        src = f"{self.username}@{self.host}:{remote_file}"
+    def _scp_down(self, remote_file: str, local_file: str) -> Tuple[int, str, str]:
         cmd = [
             "scp",
             "-P", str(self.port),
-            "-o", f"ControlPath={self.mux_socket}",
-            "-o", "ControlMaster=no",
-            src,
+            *self._common_ssh_opts(),
+            f"{self.username}@{self.host}:{remote_file}",
             local_file,
         ]
         return self._run_local(cmd)
 
+    # ── main run ─────────────────────────────────────────────────────────────
+
     def run(self):
         try:
-            mux_path = str(Path(self.mux_socket).expanduser())
-            target = f"{self.username}@{self.host}"
-            rc, out, err = self._run_local(
-                ["ssh", "-p", str(self.port), "-S", mux_path, "-O", "check", target]
-            )
-            if rc != 0:
-                raise RuntimeError(
-                    "No active SSH control socket.\n\n"
-                    "Run this once in your terminal (and complete Duo):\n"
-                    f"  ssh -M -S {mux_path} -fNT {target}\n\n"
-                    f"Then retry in app.\nDetails:\n{err or out}"
-                )
-            self.mux_socket = mux_path
-
             job_id = datetime.now().strftime("job_%Y%m%d_%H%M%S")
-            remote_base = ORCD_CPSAM_ROOT
-            remote_images_root = ORCD_IMAGES_APP_DIR
-            remote_out_root = ORCD_OUTPUT_APP_DIR
-            remote_jobs_root = f"{remote_base}/Jobs_App"
-            remote_logs_root = f"{remote_base}/logs"
-
+            # Use /tmp so we never need write permission inside the CPSAM root.
+            # /tmp is world-writable on every Linux/macOS machine.
+            remote_in  = f"/tmp/cara_cpsam_{job_id}_in"
+            remote_out = f"/tmp/cara_cpsam_{job_id}_out"
             self.local_out_dir.mkdir(parents=True, exist_ok=True)
-            self.signals.status.emit(f"SSH: using control socket {self.mux_socket}")
 
-            rc, _out, err = self._ssh(
-                f"mkdir -p {shlex.quote(remote_images_root)} {shlex.quote(remote_out_root)} "
-                f"{shlex.quote(remote_jobs_root)} {shlex.quote(remote_logs_root)}",
-            )
+            # 1 — verify SSH connection works before doing any work
+            self.signals.status.emit("GPU: checking SSH connection ...")
+            rc, _, err = self._ssh("echo connected", timeout=20)
             if rc != 0:
-                raise RuntimeError(f"Failed to create remote folders.\n{err}")
-
-            if self.use_existing_images_app:
-                remote_infer_dir = remote_images_root
-                self.signals.status.emit(f"SSH: using existing remote infer dir: {remote_infer_dir}")
-            else:
-                remote_infer_dir = f"{remote_images_root}/{job_id}"
-                rc, _out, err = self._ssh(f"mkdir -p {shlex.quote(remote_infer_dir)}")
-                if rc != 0:
-                    raise RuntimeError(f"Failed to create remote input dir.\n{err}")
-                total = len(self.image_paths)
-                for i, p in enumerate(self.image_paths, start=1):
-                    src = Path(p)
-                    self.signals.status.emit(f"SSH: upload {i}/{total} {src.name}")
-                    rc, _out, err = self._scp_upload(str(src), remote_infer_dir)
-                    if rc != 0:
-                        raise RuntimeError(f"Upload failed for {src.name}\n{err}")
-
-            remote_out_dir = f"{remote_out_root}/{job_id}"
-            rc, _out, err = self._ssh(f"mkdir -p {shlex.quote(remote_out_dir)}")
-            if rc != 0:
-                raise RuntimeError(f"Failed to create remote output dir.\n{err}")
-
-            sbatch_script = f"""
-#SBATCH -J CPSAMApp
-#SBATCH -o logs/%x_%j.out
-#SBATCH -e logs/%x_%j.err
-#SBATCH -p mit_normal_gpu
-#SBATCH -N 1
-#SBATCH -c 4
-#SBATCH --gres=gpu:h200:1
-#SBATCH --mem=64G
-#SBATCH -t 06:00:00
-
-set -euo pipefail
-cd {shlex.quote(remote_base)}
-mkdir -p logs
-
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-
-CONDA=/orcd/software/community/001/rocky8/miniforge/23.11.0-0/bin/conda
-"$CONDA" run -n cellpose python -u CPSAMMainTODO.py \\
-  --skip_train \\
-  --infer_dir {shlex.quote(remote_infer_dir)} \\
-  --out_dir {shlex.quote(remote_out_dir)} \\
-  --use_gpu \\
-  --pretrained_model ./models/cpsam_finetuned
-"""
-            remote_sbatch = f"{remote_jobs_root}/job_{job_id}.sbatch"
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sbatch", encoding="utf-8") as tf:
-                tf.write(sbatch_script)
-                local_sbatch = tf.name
-            rc, _out, err = self._scp_upload(local_sbatch, remote_jobs_root)
-            Path(local_sbatch).unlink(missing_ok=True)
-            if rc != 0:
-                raise RuntimeError(f"Failed to upload sbatch script.\n{err}")
-            # Uploaded with same basename; move to desired filename.
-            uploaded_tmp = f"{remote_jobs_root}/{Path(local_sbatch).name}"
-            rc, _out, err = self._ssh(
-                f"mv {shlex.quote(uploaded_tmp)} {shlex.quote(remote_sbatch)}"
-            )
-            if rc != 0:
-                raise RuntimeError(f"Failed to place sbatch script remotely.\n{err}")
-
-            self.signals.status.emit("SSH: submitting sbatch job ...")
-            rc, out, err = self._ssh(
-                f"cd {shlex.quote(remote_base)} && sbatch {shlex.quote(remote_sbatch)}",
-            )
-            if rc != 0:
-                raise RuntimeError(f"sbatch submission failed.\n{err}")
-            m = re.search(r"Submitted batch job\s+(\d+)", out)
-            if not m:
-                raise RuntimeError(f"Could not parse SLURM job id from output:\n{out}\n{err}")
-            slurm_id = m.group(1)
-            self.signals.status.emit(f"SSH: submitted SLURM job {slurm_id}. Waiting ...")
-
-            terminal = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
-            final_state = "UNKNOWN"
-            while True:
-                rc1, qout, _qerr = self._ssh(
-                    f"squeue -j {shlex.quote(slurm_id)} -h -o %T"
-                )
-                state = qout.strip().splitlines()[0].strip().upper() if (rc1 == 0 and qout.strip()) else ""
-                if state:
-                    self.signals.status.emit(f"SSH: SLURM {slurm_id} state = {state}")
-                    if state in terminal:
-                        final_state = state
-                        break
-                else:
-                    rc2, aout, _aerr = self._ssh(
-                        f"sacct -j {shlex.quote(slurm_id)} -n -o State | head -n 1",
-                    )
-                    if rc2 == 0 and aout.strip():
-                        state = aout.strip().split()[0].upper()
-                        self.signals.status.emit(f"SSH: SLURM {slurm_id} state = {state}")
-                        if state in terminal:
-                            final_state = state
-                            break
-                time.sleep(8)
-
-            if final_state != "COMPLETED":
                 raise RuntimeError(
-                    f"SLURM job {slurm_id} ended with state: {final_state}. "
-                    f"Check logs under {remote_logs_root}."
+                    f"SSH connection to {self.username}@{self.host} failed.\n\n"
+                    "Make sure:\n"
+                    "  • Tailscale is running on both machines\n"
+                    "  • The SSH key file path is correct\n"
+                    "  • The public key was copied to the server (ssh-copy-id)\n\n"
+                    f"Details: {err}"
                 )
 
-            downloaded = []
-            self.signals.status.emit("SSH: downloading outputs ...")
-            rc, out, err = self._ssh(f"find {shlex.quote(remote_out_dir)} -maxdepth 1 -type f")
+            # 2 — verify remote_root exists before wasting time uploading
+            self.signals.status.emit("GPU: verifying remote paths ...")
+            rc, _, err = self._ssh(
+                f"test -d {shlex.quote(self.remote_root)}", timeout=15
+            )
             if rc != 0:
-                raise RuntimeError(f"Failed listing remote output files.\n{err}")
-            for remote_fp in [ln.strip() for ln in out.splitlines() if ln.strip()]:
-                name = Path(remote_fp).name
-                low = name.lower()
-                if not low.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".csv", ".txt", ".npy", ".npz")):
-                    continue
-                local_fp = self.local_out_dir / name
-                rc, _out, err = self._scp_download(remote_fp, str(local_fp))
-                if rc != 0:
-                    raise RuntimeError(f"Failed downloading {name}\n{err}")
-                downloaded.append(str(local_fp))
+                raise RuntimeError(
+                    f"CPSAM root directory not found on the GPU server:\n"
+                    f"  {self.remote_root}\n\n"
+                    "Fix: open the GPU dialog and set 'CPSAM root' to the\n"
+                    "folder that contains your CPSAM script on the server."
+                )
+            rc, _, err = self._ssh(
+                f"test -f {shlex.quote(self.remote_root + '/' + self.cpsam_script)}",
+                timeout=15,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"CPSAM script not found on the GPU server:\n"
+                    f"  {self.remote_root}/{self.cpsam_script}\n\n"
+                    "Fix: check the 'Script filename' field in the GPU dialog."
+                )
 
-            if (not self.use_existing_images_app) and self.cleanup_uploaded_inputs:
-                self._ssh(f"rm -rf {shlex.quote(remote_infer_dir)}")
-                self.signals.status.emit("SSH: cleaned remote uploaded input folder.")
-            self.signals.status.emit(f"SSH: finished. Job {slurm_id} COMPLETED.")
+            # 3a — create remote temp dirs (hidden with _ prefix)
+            self.signals.status.emit("GPU: creating remote temp dirs ...")
+            rc, _, err = self._ssh(
+                f"mkdir -p {shlex.quote(remote_in)} {shlex.quote(remote_out)}"
+            )
+            if rc != 0:
+                raise RuntimeError(f"Could not create remote directories:\n{err}")
+
+            # 3 — upload images
+            total = len(self.image_paths)
+            for i, p in enumerate(self.image_paths, 1):
+                src = Path(p)
+                self.signals.status.emit(f"GPU: uploading {i}/{total} — {src.name}")
+                rc, _, err = self._scp_up(str(src), remote_in)
+                if rc != 0:
+                    raise RuntimeError(f"Upload failed for {src.name}:\n{err}")
+
+            # 4 — run CPSAM directly (SSH call blocks until the GPU job finishes)
+            self.signals.status.emit(
+                f"GPU: running CPSAM on {self.host} — waiting for Results ..."
+            )
+            # Non-interactive SSH shells don't source ~/.bashrc, so conda is
+            # not on PATH.  Source the conda init script explicitly first.
+            # ~/miniconda3 and ~/anaconda3 are the two common install locations;
+            # we try both and fall through silently if one doesn't exist.
+            run_cmd = (
+                "source ~/.bashrc 2>/dev/null; "
+                "[ -f ~/miniconda3/etc/profile.d/conda.sh ] && "
+                "  source ~/miniconda3/etc/profile.d/conda.sh; "
+                "[ -f ~/anaconda3/etc/profile.d/conda.sh ] && "
+                "  source ~/anaconda3/etc/profile.d/conda.sh; "
+                f"cd {shlex.quote(self.remote_root)} && "
+                f"conda run --no-capture-output -n {shlex.quote(self.conda_env)} "
+                f"python -u {shlex.quote(self.cpsam_script)} "
+                f"--skip_train "
+                f"--infer_dir {shlex.quote(remote_in)} "
+                f"--out_dir {shlex.quote(remote_out)} "
+                f"--use_gpu "
+                f"--pretrained_model {shlex.quote(self.cpsam_model)}"
+            )
+            rc, out, err = self._ssh(run_cmd, timeout=7200)  # 2-hour cap
+            if rc != 0:
+                raise RuntimeError(
+                    f"CPSAM exited with an error (exit code {rc}).\n\n"
+                    f"stderr:\n{err}\n\nstdout:\n{out}"
+                )
+
+            # 5 — list and download result files
+            self.signals.status.emit("GPU: downloading results ...")
+            rc, ls_out, err = self._ssh(
+                f"find {shlex.quote(remote_out)} -maxdepth 1 -type f"
+            )
+            if rc != 0:
+                raise RuntimeError(f"Could not list remote output files:\n{err}")
+
+            downloaded: List[str] = []
+            for remote_fp in [ln.strip() for ln in ls_out.splitlines() if ln.strip()]:
+                name = Path(remote_fp).name
+                if not name.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".csv", ".txt", ".npy")
+                ):
+                    continue
+                local_fp = str(self.local_out_dir / name)
+                self.signals.status.emit(f"GPU: downloading {name} ...")
+                rc, _, err = self._scp_down(remote_fp, local_fp)
+                if rc != 0:
+                    raise RuntimeError(f"Download failed for {name}:\n{err}")
+                downloaded.append(local_fp)
+
+            # 6 — delete all remote temp files (nothing stored permanently on GPU machine)
+            if self.cleanup_remote:
+                self.signals.status.emit("GPU: deleting remote temp files ...")
+                self._ssh(
+                    f"rm -rf {shlex.quote(remote_in)} {shlex.quote(remote_out)}"
+                )
+
+            self.signals.status.emit(
+                f"GPU: done — {len(downloaded)} file(s) saved to local output folder."
+            )
             self.signals.finished.emit(downloaded)
 
         except Exception:
@@ -1486,11 +1740,6 @@ class MainWindow(QMainWindow):
         self.results: List[ResultRow] = []
         self.gt_counts_index: Dict[Tuple[str, str, int], int] = {}
         self.gt_counts_rows: List[Tuple[str, str, int, int]] = []
-        self.cpsam_watch_dir: Optional[Path] = None
-        self.cpsam_seen_done_markers: set[str] = set()
-        self.cpsam_watch_timer = QTimer(self)
-        self.cpsam_watch_timer.setInterval(3000)
-        self.cpsam_watch_timer.timeout.connect(self._poll_cpsam_done_markers)
 
         self.active_tool: Optional[str] = None
         self.paint_color = "green"  # "blue", "pink", "red", "green", or "black"
@@ -1499,7 +1748,11 @@ class MainWindow(QMainWindow):
         self.csv_filename = "results.csv"
         self.webui_proc: Optional[subprocess.Popen] = None
         self.web_session_id: Optional[str] = None
+        self._web_tmp_files: set = set()
         self.web_saved_seen: set[str] = set()
+        # CPSAM output directories whose contents should be deleted on close
+        # unless the user has explicitly saved (on_save clears this list).
+        self._cpsam_temp_dirs: List[str] = []
         self._last_process_inputs: set[str] = set()
         self.web_sync_timer = QTimer(self)
         self.web_sync_timer.setInterval(3000)
@@ -1534,8 +1787,8 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.status_lbl = QLabel("Ready.")
+        self.status_lbl.setWordWrap(True)
         self._load_gt_counts_csv()
-        self.ssh_status_lbl = QLabel("SSH idle.")
 
         # Logo bottom-left (CENTERED more in controls ribbon)
         self.logo_label = QLabel()
@@ -1644,37 +1897,12 @@ class MainWindow(QMainWindow):
         self.btn_save = QPushButton("Save")
         self.btn_save.setProperty("primary", True)
 
-        # SSH CPSAM controls
-        self.ssh_host_edit = QLineEdit()
-        self.ssh_host_edit.setText(ORCD_HOST_DEFAULT)
-        self.ssh_host_edit.setPlaceholderText("orcd-login.mit.edu")
-        self.ssh_user_edit = QLineEdit()
-        self.ssh_user_edit.setPlaceholderText("juweiss")
-        self.ssh_pass_edit = QLineEdit()
-        self.ssh_pass_edit.setPlaceholderText("Optional: password / interactive prompt")
-        self.ssh_pass_edit.setEchoMode(QLineEdit.Password)
-        self.ssh_use_existing_cb = QCheckBox("Use existing remote Images_App (no upload)")
-        self.ssh_use_existing_cb.setChecked(False)
-        self.ssh_cleanup_cb = QCheckBox("Delete uploaded remote input folder after run")
-        self.ssh_cleanup_cb.setChecked(True)
-        self.ssh_help_lbl = QLabel(
-            "Runs your CPSAM SLURM job on MIT ORCD.\n"
-            f"Port is fixed to {ORCD_PORT_DEFAULT}. Remote dirs are fixed to:\n"
-            f"{ORCD_IMAGES_APP_DIR} and {ORCD_OUTPUT_APP_DIR}\n"
-            f"Before running, open mux session once:\n"
-            f"ssh -M -S {ORCD_MUX_SOCKET} -fNT juweiss@{ORCD_HOST_DEFAULT}"
-        )
-        self.ssh_help_lbl.setWordWrap(True)
-        self.ssh_help_lbl.setStyleSheet("color: #9aa0a6;")
-        self.btn_run_ssh = QPushButton("Run CPSAM (SSH)")
-        self.btn_run_ssh.setProperty("primary", True)
-        self.btn_run_ssh.clicked.connect(self.on_run_ssh)
 
                 # ---- Remove focus halos (prevents the “surrounding” outline bug)
         for b in (self.btn_tool_paint, self.btn_tool_select, self.btn_tool_remove,
                 self.btn_pick_folder, self.btn_pick_files, self.btn_pick_out,
                 self.btn_process_old, self.btn_process_cpsam, self.btn_web_ui_help,
-                self.btn_clear_annotations, self.btn_update_count, self.btn_save, self.btn_run_ssh, self.btn_theme_toggle):
+                self.btn_clear_annotations, self.btn_update_count, self.btn_save, self.btn_theme_toggle):
             b.setFocusPolicy(Qt.NoFocus)
 
         self.preview_mode_original.setFocusPolicy(Qt.NoFocus)
@@ -1816,23 +2044,28 @@ class MainWindow(QMainWindow):
             if token is not None:
                 label, dilu, x_suffix = token
                 gt_count = self._lookup_gt_count(label, dilu, x_suffix)
-                shown = str(gt_count) if gt_count is not None else "N/A"
-                gt_text = f"GT {label} dilu{dilu}: {shown}"
-                if gt_count is not None and algo_count is not None:
-                    diff_text = f"Diff: {algo_count - gt_count:+d}"
+                if gt_count is not None:
+                    gt_text = f"GT {label} dilu{dilu}: {gt_count}"
+                    if algo_count is not None:
+                        diff_text = f"Diff: {algo_count - gt_count:+d}"
 
-            algo_text = f"Algorithm: {algo_count}" if algo_count is not None else None
+            algo_text = f"ColonyNet: {algo_count}" if algo_count is not None else None
 
-            # current_count goes on the first overlay block only
+            # CPSAM count (from CSV) and manual live count — first overlay block only
+            cpsam_text: Optional[str] = None
             count_text: Optional[str] = None
-            if idx == 0 and current_count is not None:
-                count_text = f"Count: {current_count}"
+            if idx == 0:
+                if row.cpsam_count is not None:
+                    cpsam_text = f"CPSAM: {row.cpsam_count}"
+                if current_count is not None:
+                    count_text = f"Current Count: {current_count}"
 
-            if gt_text is not None or algo_text is not None or diff_text is not None or count_text is not None:
+            if gt_text is not None or cpsam_text is not None or algo_text is not None or diff_text is not None or count_text is not None:
                 overlays.append(
                     {
                         "position": pos,
                         "gt_text": gt_text,
+                        "cpsam_text": cpsam_text,
                         "algo_text": algo_text,
                         "diff_text": diff_text,
                         "count_text": count_text,
@@ -1872,6 +2105,14 @@ class MainWindow(QMainWindow):
         super().resizeEvent(e)
         self._position_header_checkbox()
 
+    def _cleanup_web_tmp_files(self):
+        for p in list(self._web_tmp_files):
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._web_tmp_files.clear()
+
     def _cleanup_web_sessions(self):
         sessions_dir = Path(__file__).resolve().parent / "web_jobs" / "sessions"
         if not sessions_dir.exists():
@@ -1898,9 +2139,19 @@ class MainWindow(QMainWindow):
                         self.webui_proc.wait(timeout=1.0)
                     except Exception:
                         pass
+            self._cleanup_web_tmp_files()
             self._cleanup_web_sessions()
         except Exception:
             pass
+        # Delete temporary CPSAM output directories (registered when GPU run
+        # finishes; cleared by on_save so files survive an explicit save).
+        for d in self._cpsam_temp_dirs:
+            try:
+                import shutil as _shutil
+                if Path(d).is_dir():
+                    _shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
         super().closeEvent(e)
 
     def _position_header_checkbox(self):
@@ -2006,6 +2257,7 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Controls")
         box.setObjectName("ControlsPanel")
         box.setMinimumWidth(320)
+        box.setMaximumWidth(360)
         layout = QVBoxLayout(box)
 
         layout.addWidget(self.btn_pick_folder)
@@ -2043,15 +2295,8 @@ class MainWindow(QMainWindow):
         box = QGroupBox("GPU (SSH)")
         lay = QGridLayout(box)
         lay.addWidget(QLabel("Host"), 0, 0)
-        lay.addWidget(self.ssh_host_edit, 0, 1)
         lay.addWidget(QLabel("User"), 1, 0)
-        lay.addWidget(self.ssh_user_edit, 1, 1)
         lay.addWidget(QLabel("Password"), 2, 0)
-        lay.addWidget(self.ssh_pass_edit, 2, 1)
-        lay.addWidget(self.ssh_use_existing_cb, 3, 0, 1, 2)
-        lay.addWidget(self.ssh_cleanup_cb, 4, 0, 1, 2)
-        lay.addWidget(self.ssh_help_lbl, 5, 0, 1, 2)
-        lay.addWidget(self.btn_run_ssh, 6, 0, 1, 2)
         return box
 
     def _build_post_panel(self) -> QWidget:
@@ -2251,7 +2496,6 @@ class MainWindow(QMainWindow):
             self.btn_web_ui_help.setProperty("primary", True)
             self.btn_theme_toggle.setText("Switch To Dark Mode")
             self.lbl_or.setStyleSheet("color: #6e6253; padding: 2px 0;")
-            self.ssh_help_lbl.setStyleSheet("color: #6e6253;")
         else:
             self._apply_dark_palette()
             if app is not None:
@@ -2259,7 +2503,6 @@ class MainWindow(QMainWindow):
             self.btn_web_ui_help.setProperty("primary", False)
             self.btn_theme_toggle.setText("Switch To Light Mode")
             self.lbl_or.setStyleSheet("color: #777; padding: 2px 0;")
-            self.ssh_help_lbl.setStyleSheet("color: #9aa0a6;")
         self._refresh_widget_style(self.btn_web_ui_help)
         self._load_logo()
         self._force_table_dark()
@@ -2401,16 +2644,20 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status_lbl.setText("Starting…")
 
-        task = ProcessImagesTask(
+        # Keep a strong reference on self so that task.signals (a QObject) is
+        # never destroyed on the background thread while the main thread still
+        # has queued signal deliveries pending — that race causes SIGSEGV via
+        # Shiboken's QRunnableWrapper destructor.
+        self._active_task = ProcessImagesTask(
             image_paths=paths_to_process,
             out_dir=out_dir,
         )
-        task.signals.progress.connect(self.on_progress)
-        task.signals.message.connect(self.on_message)
-        task.signals.result.connect(self.on_results)
-        task.signals.error.connect(self.on_error)
-        task.signals.row_ready.connect(self.on_row_ready)
-        self.thread_pool.start(task)
+        self._active_task.signals.progress.connect(self.on_progress)
+        self._active_task.signals.message.connect(self.on_message)
+        self._active_task.signals.result.connect(self.on_results)
+        self._active_task.signals.error.connect(self.on_error)
+        self._active_task.signals.row_ready.connect(self.on_row_ready)
+        self.thread_pool.start(self._active_task)
 
     def on_progress(self, done: int, total: int):
         pct = int(round((done / max(total, 1)) * 100))
@@ -2697,10 +2944,35 @@ class MainWindow(QMainWindow):
 
         algo_mask = self._get_algorithm_mask(row)
         if algo_mask is not None and algo_mask.shape == (h, w):
+            # ColonyNet binary mask
             pp.paint_mask_green = algo_mask.copy().astype(np.uint8)
-        yellow_mask = self._get_yellow_boundary_mask(row, h, w)
-        if yellow_mask is not None and yellow_mask.shape == (h, w):
-            pp.paint_mask_yellow = yellow_mask.copy().astype(np.uint8)
+            yellow_mask = self._get_yellow_boundary_mask(row, h, w)
+            if yellow_mask is not None and yellow_mask.shape == (h, w):
+                pp.paint_mask_yellow = yellow_mask.copy().astype(np.uint8)
+        elif row.cpsam_count is not None and row.tif_paths:
+            # CPSAM overlay: pure green [0,255,0] = colony pixels,
+            # pure yellow [255,255,0] = boundary lines between touching instances.
+            # PNG is lossless so exact-value detection is 100 % reliable.
+            try:
+                ov = cv_read_rgb_anydepth(row.tif_paths[0])
+                if ov is not None and ov.ndim == 3:
+                    ov = ov.astype(np.int32)
+                    R, G, B = ov[:, :, 0], ov[:, :, 1], ov[:, :, 2]
+                    green_mask  = ((R == 0)   & (G == 255) & (B == 0)  ).astype(np.uint8) * 255
+                    yellow_mask = ((R == 255) & (G == 255) & (B == 0)  ).astype(np.uint8) * 255
+                    if green_mask.shape != (h, w):
+                        green_mask  = cv2.resize(green_mask,  (w, h), interpolation=cv2.INTER_NEAREST)
+                        yellow_mask = cv2.resize(yellow_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    if np.any(green_mask):
+                        pp.paint_mask_green  = green_mask
+                    if np.any(yellow_mask):
+                        pp.paint_mask_yellow = yellow_mask
+            except Exception:
+                pass
+        else:
+            yellow_mask = self._get_yellow_boundary_mask(row, h, w)
+            if yellow_mask is not None and yellow_mask.shape == (h, w):
+                pp.paint_mask_yellow = yellow_mask.copy().astype(np.uint8)
         row.masked_green_initialized = True
 
     def _compose_with_annotations(
@@ -2790,7 +3062,8 @@ class MainWindow(QMainWindow):
         pp = row.pp_masked
         pp.ensure_shape(h, w)
         count = 0
-        # Green colonies minus yellow watershed boundaries
+        # Green colonies (ColonyNet binary mask OR CPSAM extracted from overlay)
+        # minus yellow watershed/boundary pixels — identical logic for both algorithms.
         green = pp.paint_mask_green
         if green is not None:
             yellow = pp.paint_mask_yellow
@@ -2835,12 +3108,14 @@ class MainWindow(QMainWindow):
         for ov in overlays:
             if ov.get("gt_text"):
                 parts.append(f'<span style="color:{gt_col};">{ov["gt_text"]}</span>')
+            if ov.get("cpsam_text"):
+                parts.append(f'<span style="color:{count_col};">{ov["cpsam_text"]}</span>')
             if ov.get("algo_text"):
                 parts.append(f'<span style="color:{algo_col};">{ov["algo_text"]}</span>')
             if ov.get("diff_text"):
                 parts.append(f'<span style="color:{diff_col};">{ov["diff_text"]}</span>')
             if ov.get("count_text"):
-                parts.append(f'<span style="color:{count_col};">{ov["count_text"]}</span>')
+                parts.append(f'<span style="color:{algo_col};">{ov["count_text"]}</span>')
         html = "<br>".join(parts)
         self.count_info_lbl.setText(
             f'<div style="background:{bg};padding:6px;border-radius:4px;'
@@ -2852,11 +3127,15 @@ class MainWindow(QMainWindow):
         if row is None:
             return
         want_masked = self.preview_mode_masked.isChecked()
-        self._update_count_info_lbl(row)
         try:
             original, masked = self._get_base_images(row)
             if want_masked:
                 self._ensure_masked_seed(row, masked.shape[0], masked.shape[1])
+                # Auto-compute current count on first view (or after CPSAM results arrive).
+                if row.current_count is None and (row.post_mask_paths or row.tif_paths):
+                    row.current_count = self._count_cfus_from_mask(
+                        row, masked.shape[0], masked.shape[1]
+                    )
                 composed = self._compose_with_annotations(masked, row.pp_masked)
             else:
                 composed = self._compose_with_annotations(original, row.pp_original)
@@ -2865,6 +3144,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self.preview_label.setText("Preview render failed.")
             self.preview_label.setPixmap(QPixmap())
+        self._update_count_info_lbl(row)
 
     def _set_tool(self, tool: Optional[str]):
         if self.btn_tool_paint.isChecked():
@@ -3184,7 +3464,9 @@ class MainWindow(QMainWindow):
     def on_save(self):
         """
         SAVE = saves CSV + writes annotated images to output folder.
+        User explicitly saved — CPSAM temp files are now permanent.
         """
+        self._cpsam_temp_dirs.clear()
         # Save CSV without its own popup (we show one combined popup at the end)
         self._suppress_csv_popup = True
         try:
@@ -3227,218 +3509,256 @@ class MainWindow(QMainWindow):
         except Exception:
             QMessageBox.critical(self, "Save error", traceback.format_exc())
 
-    def _build_cpsam_terminal_script(self, host: str, user: str, remote_root: str, image_paths: List[str], local_out_dir: Path) -> str:
-        # One terminal script: login/2FA once (mux), upload, submit, poll, download.
-        image_list = " \\\n  ".join(shlex.quote(str(Path(p))) for p in image_paths)
-        return f"""set +H
-set -euo pipefail
-
-HOST={shlex.quote(host)}
-USER={shlex.quote(user)}
-REMOTE_ROOT={shlex.quote(remote_root)}
-JOB_ID="app_$(date +%Y%m%d_%H%M%S)"
-REMOTE_IN="$REMOTE_ROOT/Images_App/$JOB_ID"
-REMOTE_OUT="$REMOTE_ROOT/Output_App/$JOB_ID"
-REMOTE_LOGS="$REMOTE_ROOT/logs"
-REMOTE_JOB="$REMOTE_ROOT/Jobs_App/$JOB_ID.sbatch"
-LOCAL_OUT={shlex.quote(str(local_out_dir))}
-MARKER="$LOCAL_OUT/.cpsam_done_$JOB_ID"
-MUX="$HOME/.ssh/orcd_mux"
-CONDA="/orcd/software/community/001/rocky8/miniforge/23.11.0-0/bin/conda"
-
-mkdir -p "$LOCAL_OUT"
-mkdir -p "$HOME/.ssh"
-
-echo "[0/5] Login + Duo once (create/reuse SSH mux socket)..."
-ssh -M -S "$MUX" -fNT "$USER@$HOST"
-ssh -S "$MUX" "$USER@$HOST" "echo connected"
-
-echo "[1/5] Ensure remote folders exist..."
-ssh -S "$MUX" "$USER@$HOST" "mkdir -p '$REMOTE_IN' '$REMOTE_OUT' '$REMOTE_LOGS' '$REMOTE_ROOT/Jobs_App'"
-
-echo "[2/5] Upload selected images to $REMOTE_IN ..."
-for f in \\
-  {image_list}
-do
-  scp -o ControlPath="$MUX" "$f" "$USER@$HOST:$REMOTE_IN/"
-done
-
-echo "[3/5] Create and submit sbatch ..."
-ssh -S "$MUX" "$USER@$HOST" "(
-printf '#\\041/bin/bash\\n'
-cat <<'SBATCH'
-#SBATCH -J CPSAMApp
-#SBATCH -o logs/%x_%j.out
-#SBATCH -e logs/%x_%j.err
-#SBATCH -p mit_normal_gpu
-#SBATCH -N 1
-#SBATCH -c 4
-#SBATCH --gres=gpu:h200:1
-#SBATCH --mem=64G
-#SBATCH -t 06:00:00
-
-set -euo pipefail
-cd '$REMOTE_ROOT'
-mkdir -p logs
-
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-
-\"$CONDA\" run -n cellpose python -u CPSAMMainTODO.py \\
-  --skip_train \\
-  --infer_dir '$REMOTE_IN' \\
-  --out_dir '$REMOTE_OUT' \\
-  --use_gpu \\
-  --pretrained_model ./models/cpsam_finetuned
-SBATCH
-) > '$REMOTE_JOB'"
-JOB_NUM=$(ssh -S "$MUX" "$USER@$HOST" "cd '$REMOTE_ROOT' && sbatch '$REMOTE_JOB'" | awk '{{print $4}}')
-echo "Submitted job: $JOB_NUM"
-echo "Queue:"
-ssh -S "$MUX" "$USER@$HOST" "squeue -j $JOB_NUM -o '%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R'"
-
-echo "[4/5] Wait for completion ..."
-while ssh -S "$MUX" "$USER@$HOST" "squeue -j $JOB_NUM -h | grep -q ."; do
-  ssh -S "$MUX" "$USER@$HOST" "squeue -j $JOB_NUM -h -o 'state=%T elapsed=%M nodes=%D reason=%R' || true"
-  sleep 10
-done
-echo "Queue done. Final accounting:"
-ssh -S "$MUX" "$USER@$HOST" "sacct -j $JOB_NUM -n -o JobID,State,Elapsed,ExitCode | head -n 5 || true"
-
-echo
-echo "[5/5] Download outputs ..."
-rsync -av --progress -e "ssh -S $MUX" "$USER@$HOST:$REMOTE_OUT/" "$LOCAL_OUT/"
-touch "$MARKER"
-
-echo
-echo "Done. In app use: Select Folder -> $LOCAL_OUT"
-echo "Done marker: $MARKER"
-echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
-"""
-
     def on_open_cpsam_dialog(self):
         image_paths = self._get_ssh_input_paths()
         if not image_paths:
             QMessageBox.warning(self, "No input", "Select/check images first.")
             return
 
+        # ── Auto-trigger first-time setup wizard if needed ────────────────────
+        _s = QSettings("CARA", "CPSAMGPUServer")
+        _setup_done  = _s.value("setup_done", "") == "1"
+        _saved_host  = _s.value("gpu_host",  GPU_HOST_DEFAULT)
+        _saved_user  = _s.value("gpu_user",  GPU_USER_DEFAULT)
+        _saved_key   = Path(_s.value("gpu_key", GPU_KEY_DEFAULT)).expanduser()
+        _saved_port  = int(_s.value("gpu_port", str(GPU_PORT_DEFAULT)))
+
+        if not _setup_done or not _saved_key.exists():
+            wizard = GPUSetupWizard(
+                self,
+                host=_saved_host,
+                port=_saved_port,
+                username=_saved_user,
+                key_path=_saved_key,
+            )
+            wizard.exec()
+            if not wizard.setup_ok:
+                return   # user cancelled or setup failed — don't open main dialog
+            _s.sync()   # reload settings saved by wizard
+
+        # ── Main GPU server dialog ────────────────────────────────────────────
         out_base = self._csv_path()
         if out_base is None:
-            local_out_dir = Path.cwd() / "cpsam_terminal_out"
+            local_out_dir = Path.cwd() / "cpsam_out"
         else:
-            local_out_dir = out_base.parent / "cpsam_terminal_out"
+            local_out_dir = out_base.parent / "cpsam_out"
         local_out_dir.mkdir(parents=True, exist_ok=True)
-        self.cpsam_watch_dir = local_out_dir
-        self.cpsam_watch_timer.start()
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("CPSAM via SSH (Terminal Workflow)")
-        dlg.resize(900, 620)
+        dlg.setWindowTitle("CPSAM — GPU Server")
+        dlg.resize(820, 600)
         lay = QVBoxLayout(dlg)
 
-        form = QGridLayout()
-        host_edit = QLineEdit(ORCD_HOST_DEFAULT)
-        user_edit = QLineEdit("juweiss")
-        root_edit = QLineEdit(ORCD_CPSAM_ROOT)
-        form.addWidget(QLabel("Host"), 0, 0)
-        form.addWidget(host_edit, 0, 1)
-        form.addWidget(QLabel("User"), 1, 0)
-        form.addWidget(user_edit, 1, 1)
-        form.addWidget(QLabel("Remote root"), 2, 0)
-        form.addWidget(root_edit, 2, 1)
-        lay.addLayout(form)
+        # QSettings already loaded above; re-read in case wizard updated them
+        _s = QSettings("CARA", "CPSAMGPUServer")
 
-        info = QLabel(
-            "This workflow uses your regular terminal SSH (key/passphrase + Duo).\n"
-            "1) Upload selected images to Images_App\n"
-            "2) Submit job.sbatch on ORCD\n"
-            "3) Download outputs back locally"
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("color: #9aa0a6;")
-        lay.addWidget(info)
+        form2 = QGridLayout()
+        form2.setColumnMinimumWidth(0, 110)
 
-        script_box = QPlainTextEdit()
-        script_box.setReadOnly(True)
-        lay.addWidget(script_box, 1)
+        gpu_host_edit   = QLineEdit(_s.value("gpu_host",   GPU_HOST_DEFAULT))
+        gpu_port_edit   = QLineEdit(_s.value("gpu_port",   str(GPU_PORT_DEFAULT)))
+        gpu_user_edit   = QLineEdit(_s.value("gpu_user",   GPU_USER_DEFAULT))
+        gpu_key_edit    = QLineEdit(_s.value("gpu_key",    GPU_KEY_DEFAULT))
+        gpu_root_edit   = QLineEdit(_s.value("gpu_root",   GPU_CPSAM_ROOT))
+        gpu_env_edit    = QLineEdit(_s.value("gpu_env",    GPU_CONDA_ENV))
+        gpu_script_edit = QLineEdit(_s.value("gpu_script", GPU_CPSAM_SCRIPT))
+        gpu_model_edit  = QLineEdit(_s.value("gpu_model",  GPU_CPSAM_MODEL))
 
-        btn_row = QWidget()
-        btn_lay = QHBoxLayout(btn_row)
-        btn_lay.setContentsMargins(0, 0, 0, 0)
-        btn_refresh = QPushButton("Refresh Script")
-        btn_copy = QPushButton("Copy Script")
+        fields = [
+            ("Host / Tailscale IP", gpu_host_edit,
+             "IP or hostname of the GPU machine (e.g. 100.126.92.100)"),
+            ("Port",                gpu_port_edit,   "SSH port — usually 22"),
+            ("Username",            gpu_user_edit,   "Your account name on the GPU machine"),
+            ("SSH key file",        gpu_key_edit,
+             "Local private key path — e.g. ~/.ssh/gpu_server_key"),
+            ("CPSAM root",          gpu_root_edit,
+             "Folder containing CPSAM.py on the GPU machine"),
+            ("Conda env",           gpu_env_edit,    "Conda environment that has cellpose"),
+            ("Script filename",     gpu_script_edit, "Name of the CPSAM script, e.g. CPSAM.py"),
+            ("Model path",          gpu_model_edit,
+             "Path to the finetuned model (relative to CPSAM root or absolute)"),
+        ]
+        for row_i, (label, widget, tip) in enumerate(fields):
+            lbl = QLabel(label)
+            widget.setToolTip(tip)
+            form2.addWidget(lbl,    row_i, 0)
+            form2.addWidget(widget, row_i, 1)
+
+        lay.addLayout(form2)
+
+
+        gpu_status_lbl = QLabel("Ready.")
+        gpu_status_lbl.setWordWrap(True)
+        lay.addWidget(gpu_status_lbl)
+
+        btn_row2 = QWidget()
+        blay2 = QHBoxLayout(btn_row2)
+        blay2.setContentsMargins(0, 0, 0, 0)
+        btn_gpu_run = QPushButton("Run on GPU Server")
+        btn_gpu_run.setProperty("primary", True)
+        blay2.addWidget(btn_gpu_run)
+        blay2.addStretch(1)
+        lay.addWidget(btn_row2)
+
+        lay.addStretch(1)
+
+        # ── Bottom row: reset setup + close ──────────────────────────────────
+        btn_close_row = QWidget()
+        blay_close = QHBoxLayout(btn_close_row)
+        blay_close.setContentsMargins(0, 4, 0, 0)
+        btn_reset = QPushButton("Re-run Setup…")
+        btn_reset.setToolTip("Run the setup wizard again (e.g. new machine or new password)")
         btn_close = QPushButton("Close")
-        btn_lay.addWidget(btn_refresh)
-        btn_lay.addWidget(btn_copy)
-        btn_lay.addStretch(1)
-        btn_lay.addWidget(btn_close)
-        lay.addWidget(btn_row)
+        blay_close.addWidget(btn_reset)
+        blay_close.addStretch(1)
+        blay_close.addWidget(btn_close)
+        lay.addWidget(btn_close_row)
 
-        def refresh_script():
-            script = self._build_cpsam_terminal_script(
-                host=host_edit.text().strip() or ORCD_HOST_DEFAULT,
-                user=user_edit.text().strip() or "juweiss",
-                remote_root=root_edit.text().strip() or ORCD_CPSAM_ROOT,
-                image_paths=image_paths,
-                local_out_dir=local_out_dir,
-            )
-            script_box.setPlainText(script)
-
-        btn_refresh.clicked.connect(refresh_script)
-        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(script_box.toPlainText()))
-        btn_copy.clicked.connect(lambda: self.status_lbl.setText("CPSAM terminal script copied to clipboard."))
         btn_close.clicked.connect(dlg.accept)
 
-        refresh_script()
+        def _rerun_setup():
+            _s.setValue("setup_done", "")
+            _s.sync()
+            dlg.accept()
+            # Defer the reopen so the current dialog fully tears down first,
+            # preventing re-entrant Qt event handling that causes SIGSEGV.
+            QTimer.singleShot(0, self.on_open_cpsam_dialog)
+
+        btn_reset.clicked.connect(_rerun_setup)
+
+        # ── GPU run logic ─────────────────────────────────────────────────────
+
+        def _save_gpu_settings():
+            _s.setValue("gpu_host",   gpu_host_edit.text().strip())
+            _s.setValue("gpu_port",   gpu_port_edit.text().strip())
+            _s.setValue("gpu_user",   gpu_user_edit.text().strip())
+            _s.setValue("gpu_key",    gpu_key_edit.text().strip())
+            _s.setValue("gpu_root",   gpu_root_edit.text().strip())
+            _s.setValue("gpu_env",    gpu_env_edit.text().strip())
+            _s.setValue("gpu_script", gpu_script_edit.text().strip())
+            _s.setValue("gpu_model",  gpu_model_edit.text().strip())
+
+        def _on_gpu_run():
+            host   = gpu_host_edit.text().strip()
+            user   = gpu_user_edit.text().strip()
+            key    = gpu_key_edit.text().strip() or GPU_KEY_DEFAULT
+            root   = gpu_root_edit.text().strip()
+            script = gpu_script_edit.text().strip()
+            model  = gpu_model_edit.text().strip()
+            env    = gpu_env_edit.text().strip() or GPU_CONDA_ENV
+            try:
+                port = int(gpu_port_edit.text().strip() or "22")
+            except ValueError:
+                port = 22
+
+            missing = [n for n, v in [("Host / IP", host), ("Username", user),
+                                       ("CPSAM root", root), ("Script filename", script)]
+                       if not v]
+            if missing:
+                QMessageBox.warning(
+                    dlg, "Missing fields",
+                    "Please fill in: " + ", ".join(missing)
+                )
+                return
+
+            _save_gpu_settings()
+            btn_gpu_run.setEnabled(False)
+            gpu_status_lbl.setText("Connecting ...")
+
+            # Store signals on self (main-thread object) — NOT as a local
+            # variable.  A local dies when _on_gpu_run() returns, leaving
+            # task.signals as the sole reference.  The thread pool then destroys
+            # it on the background thread → SIGSEGV.  Keeping it on self
+            # guarantees it outlives the runnable's background-thread teardown.
+            self._cpsam_signals = SSHJobSignals()
+            task = DirectSSHCPSAMTask(
+                image_paths=image_paths,
+                local_out_dir=local_out_dir,
+                host=host,
+                port=port,
+                username=user,
+                key_file=key,
+                remote_root=root,
+                conda_env=env,
+                cpsam_script=script,
+                cpsam_model=model,
+                signals=self._cpsam_signals,
+                cleanup_remote=True,
+            )
+            self._cpsam_signals.status.connect(gpu_status_lbl.setText)
+            self._cpsam_signals.status.connect(self.status_lbl.setText)
+            self._cpsam_signals.finished.connect(_on_gpu_done)
+            self._cpsam_signals.error.connect(_on_gpu_error)
+            self.thread_pool.start(task)
+
+        def _on_gpu_done(outputs):
+            btn_gpu_run.setEnabled(True)
+            outs = list(outputs)
+            gpu_status_lbl.setText(
+                f"Done — {len(outs)} file(s) saved to {local_out_dir}"
+            )
+            self.status_lbl.setText(gpu_status_lbl.text())
+            # Register the output directory for cleanup on close.
+            out_dir_str = str(local_out_dir)
+            if out_dir_str not in self._cpsam_temp_dirs:
+                self._cpsam_temp_dirs.append(out_dir_str)
+            if outs:
+                loaded = self._attach_cpsam_outputs_to_originals(outs)
+                msg = f"CPSAM GPU run finished.\n{len(outs)} file(s) downloaded."
+                if loaded:
+                    msg += f"\n{loaded} image(s) matched and shown in the table."
+                QMessageBox.information(dlg, "GPU CPSAM finished", msg)
+            else:
+                QMessageBox.information(
+                    dlg, "GPU CPSAM finished",
+                    "Run completed but no output files were downloaded.\n"
+                    "Check the CPSAM script output for errors."
+                )
+
+        def _on_gpu_error(tb: str):
+            btn_gpu_run.setEnabled(True)
+            gpu_status_lbl.setText("Error — see details.")
+            self.status_lbl.setText("GPU CPSAM error.")
+            QMessageBox.critical(dlg, "GPU CPSAM error", tb)
+
+        btn_gpu_run.clicked.connect(_on_gpu_run)
+
         dlg.exec()
-
-    def _poll_cpsam_done_markers(self):
-        if self.cpsam_watch_dir is None or not self.cpsam_watch_dir.exists():
-            return
-        markers = sorted(self.cpsam_watch_dir.glob(".cpsam_done_*"))
-        new_markers = [str(m) for m in markers if str(m) not in self.cpsam_seen_done_markers]
-        if not new_markers:
-            return
-
-        self.cpsam_seen_done_markers.update(new_markers)
-
-        paths = []
-        for p in sorted(self.cpsam_watch_dir.iterdir()):
-            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
-                paths.append(str(p))
-        if not paths:
-            return
-
-        loaded = self._attach_cpsam_outputs_to_originals(paths)
-        if loaded <= 0:
-            self.status_lbl.setText("CPSAM finished (no new matched outputs).")
-            return
-        self.status_lbl.setText(f"CPSAM results ready: matched {loaded} original image(s).")
-        QMessageBox.information(
-            self,
-            "CPSAM finished",
-            f"New CPSAM results detected from:\n{self.cpsam_watch_dir}\n\n"
-            f"Matched to {loaded} original image row(s).",
-        )
 
     def _attach_cpsam_outputs_to_originals(self, output_paths: List[str]) -> int:
         if not self.results:
             return 0
 
-        # Build output index by stem for quick matching.
-        outs = [Path(p) for p in output_paths]
+        # Parse CPSAM count CSV if present — keyed by image_name stem (lowercased).
+        cpsam_counts: Dict[str, int] = {}
+        for p in output_paths:
+            if Path(p).name.lower() == "countcfuapp_test_results.csv":
+                try:
+                    import csv as _csv
+                    with open(p, newline="", encoding="utf-8-sig") as _f:
+                        for _row in _csv.DictReader(_f):
+                            name = (_row.get("image_name") or "").strip()
+                            cnt_str = (_row.get("count") or "").strip()
+                            if name and cnt_str.isdigit():
+                                stem_key = Path(name).stem.lower()
+                                cpsam_counts[stem_key] = int(cnt_str)
+                except Exception:
+                    pass
+                break
+
+        # Build output index by stem — skip CSV files.
+        outs = [Path(p) for p in output_paths if Path(p).suffix.lower() != ".csv"]
         out_stems = {p: p.stem.lower() for p in outs}
 
         matched_rows = 0
         first_matched_idx: Optional[int] = None
         for i, row in enumerate(self.results):
             src_stem = Path(row.source_image).stem.lower()
+
             matched = []
             for p in outs:
                 s = out_stems[p]
-                if s == src_stem or s.startswith(src_stem + "_") or s.startswith(src_stem):
+                if s == src_stem or s.startswith(src_stem + "_"):
                     matched.append(str(p))
 
             if not matched:
@@ -3447,7 +3767,10 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
             matched_rows += 1
             if first_matched_idx is None:
                 first_matched_idx = i
-            matched_has_non_annotated = any("_annotated" not in Path(p).stem.lower() for p in matched)
+
+            # Overlay images → tif_paths (for display).
+            # The original source image is set as expt_paths so the unmodified
+            # image is used as the editing base (identical to how ColonyNet works).
             matched.sort(
                 key=lambda p: (
                     0 if "_annotated" in Path(p).stem.lower() else 1,
@@ -3455,20 +3778,28 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
                     Path(p).name.lower(),
                 )
             )
-            if matched_has_non_annotated:
+            non_ann = [p for p in matched if "_annotated" not in Path(p).stem.lower()]
+            if non_ann:
                 row.prefer_annotated = False
-                non_ann = [p for p in matched if "_annotated" not in Path(p).stem.lower()]
                 newest = max(
                     non_ann,
                     key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0.0,
                 )
-                # Replace any older/non-CPSAM mask with the newest non-annotated result only.
                 row.tif_paths = [newest]
             else:
                 row.prefer_annotated = True
                 existing = [x for x in row.tif_paths if x not in matched]
                 row.tif_paths = matched + existing
+
+            # Use original source image as editing base (so erasing shows the real image).
+            row.expt_paths = [row.source_image]
+
             row._masked_cache = None
+            row.masked_green_initialized = False   # re-extract green/yellow from new overlay
+            row.current_count = None               # will be auto-computed on next select
+            # Attach count from CPSAM CSV if available for this source image.
+            if src_stem in cpsam_counts:
+                row.cpsam_count = cpsam_counts[src_stem]
             self._update_table_row(i, row)
 
         if matched_rows > 0:
@@ -3482,7 +3813,7 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
         return matched_rows
 
     def _export_mask_for_web(self, r: "ResultRow", kind: str) -> Optional[str]:
-        """Write current in-memory mask to a temp PNG and return its path, or None."""
+        """Write current in-memory mask to the system temp dir and return its path, or None."""
         pp = r.pp_masked
         if kind == "green":
             mask = pp.paint_mask_green
@@ -3491,16 +3822,18 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
         if mask is None or not np.any(mask):
             return None
         try:
+            import tempfile as _tempfile
             suffix = f"_web_{kind}.png"
             stem = Path(r.source_image).stem
-            tmp_dir = Path(r.source_image).parent
-            tmp_path = tmp_dir / f"{stem}{suffix}"
+            tmp_path = Path(_tempfile.gettempdir()) / f"{stem}{suffix}"
             cv2.imwrite(str(tmp_path), mask)
+            self._web_tmp_files.add(str(tmp_path))
             return str(tmp_path)
         except Exception:
             return None
 
     def on_web_ui_help(self):
+        self._cleanup_web_tmp_files()
         rows = []
         selected_paths = set(self._get_checked_or_all_source_paths())
         src_rows = self.results if self.results else [ResultRow(source_image=p, tif_paths=[]) for p in self.selected_images]
@@ -3523,17 +3856,19 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
                 if exported_green:
                     base_post_masks = [exported_green]
                 if exported_yellow:
-                    # Build a fake tif by stitching yellow into an overlay RGB PNG
+                    # Build an overlay RGB PNG with green+yellow so the webapp
+                    # can extract the yellow boundary mask from it.
                     try:
+                        import tempfile as _tempfile
                         h, w = r.pp_masked.paint_mask_yellow.shape[:2]
                         overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
                         ym = r.pp_masked.paint_mask_yellow > 0
                         overlay_rgb[ym] = [255, 255, 0]
-                        # also paint green so the base image is still useful
                         gm = r.pp_masked.paint_mask_green > 0
                         overlay_rgb[gm] = [0, 255, 0]
-                        tmp_overlay = Path(r.source_image).parent / f"{Path(r.source_image).stem}_web_overlay.png"
+                        tmp_overlay = Path(_tempfile.gettempdir()) / f"{Path(r.source_image).stem}_web_overlay.png"
                         cv2.imwrite(str(tmp_overlay), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+                        self._web_tmp_files.add(str(tmp_overlay))
                         base_tifs = [str(tmp_overlay)]
                     except Exception:
                         pass
@@ -3725,7 +4060,6 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
         Read a webapp-saved annotated PNG (base image + overlay composite) and
         decode its pixel colors back into the row's pp_masked masks.
         Green pixels → paint_mask_green, yellow → paint_mask_yellow.
-        Removes any pixels that were erased in the webapp (i.e. no longer green/yellow).
         Returns True if something changed.
         """
         try:
@@ -3733,23 +4067,46 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
             if bgr is None:
                 return False
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.int32)
-            h, w = rgb.shape[:2]
-
-            self._ensure_masked_seed(row, h, w)
-            pp = row.pp_masked
-            pp.ensure_shape(h, w)
 
             r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
 
-            # Green: high G, low R, low B
-            green_mask = (g > 180) & (r < 80) & (b < 80)
-            # Yellow: high R+G, low B
-            yellow_mask = (r > 180) & (g > 180) & (b < 80)
+            # Decode exact paint colors — canvas uses pure integer RGB values so
+            # thresholds can be very tight, avoiding false matches with image content.
+            # Green  (0,255,0)   — algorithm seed + user green paint
+            green_mask  = ((g > 240) & (r <  15) & (b <  15)).astype(np.uint8) * 255
+            # Yellow (255,255,0) — algorithm watershed boundaries
+            yellow_mask = ((r > 240) & (g > 240) & (b <  15)).astype(np.uint8) * 255
+            # Blue   (0,0,255)
+            blue_mask   = ((b > 240) & (r <  15) & (g <  15)).astype(np.uint8) * 255
+            # Pink   (255,0,180)
+            pink_mask   = ((r > 240) & (g <  15) & (b > 160) & (b < 200)).astype(np.uint8) * 255
+            # Red    (255,0,0)
+            red_mask    = ((r > 240) & (g <  15) & (b <  15)).astype(np.uint8) * 255
 
-            pp.paint_mask_green = green_mask.astype(np.uint8) * 255
-            pp.paint_mask_yellow = yellow_mask.astype(np.uint8) * 255
+            # Get the actual base image dimensions so masks survive pp.ensure_shape()
+            _, masked_base = self._get_base_images(row)
+            H, W = masked_base.shape[:2]
+
+            def _resize(m: np.ndarray) -> np.ndarray:
+                if m.shape == (H, W):
+                    return m
+                return cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+
+            green_mask  = _resize(green_mask)
+            yellow_mask = _resize(yellow_mask)
+            blue_mask   = _resize(blue_mask)
+            pink_mask   = _resize(pink_mask)
+            red_mask    = _resize(red_mask)
+
+            # Initialize seed once so ensure_shape won't clobber us
+            self._ensure_masked_seed(row, H, W)
+            pp = row.pp_masked
+            pp.paint_mask_green  = green_mask
+            pp.paint_mask_yellow = yellow_mask
+            pp.paint_mask_blue   = blue_mask
+            pp.paint_mask_pink   = pink_mask
+            pp.paint_mask_red    = red_mask
             row.user_modified_mask = True
-            row._masked_cache = None
             return True
         except Exception:
             return False
@@ -3789,6 +4146,14 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
                 src_stem = Path(row.source_image).stem.lower()
                 if png_stem.startswith(src_stem):
                     if self._apply_webapp_annotated_to_row(row, png_path):
+                        # Auto-update count so all painted colors (green/blue/pink/red) are reflected
+                        try:
+                            _, masked_base = self._get_base_images(row)
+                            row.current_count = self._count_cfus_from_mask(
+                                row, masked_base.shape[0], masked_base.shape[1]
+                            )
+                        except Exception:
+                            pass
                         loaded += 1
                     break
 
@@ -3803,71 +4168,6 @@ echo "Optional close mux: ssh -S $MUX -O exit $USER@$HOST"
         if targets:
             return [r.source_image for r in targets]
         return list(self.selected_images)
-
-    def on_run_ssh(self):
-        host = self.ssh_host_edit.text().strip()
-        user = self.ssh_user_edit.text().strip()
-        password = self.ssh_pass_edit.text()
-        port = ORCD_PORT_DEFAULT
-
-        image_paths = self._get_ssh_input_paths()
-        if not image_paths:
-            QMessageBox.warning(self, "No input", "Select images first.")
-            return
-        if not host or not user:
-            QMessageBox.warning(self, "Missing SSH fields", "Fill Host and User.")
-            return
-
-        out_base = self._csv_path()
-        if out_base is None:
-            local_out_dir = Path.cwd() / "cpsam_ssh_out"
-        else:
-            local_out_dir = out_base.parent / "cpsam_ssh_out"
-
-        self.btn_run_ssh.setEnabled(False)
-        self.ssh_status_lbl.setText("SSH: starting...")
-        self.status_lbl.setText("Starting remote CPSAM...")
-
-        task = SSHCPSAMTask(
-            image_paths=image_paths,
-            local_out_dir=local_out_dir,
-            host=host,
-            port=port,
-            username=user,
-            password=password,
-            use_existing_images_app=self.ssh_use_existing_cb.isChecked(),
-            cleanup_uploaded_inputs=self.ssh_cleanup_cb.isChecked(),
-            mux_socket=ORCD_MUX_SOCKET,
-        )
-        task.signals.status.connect(self.on_ssh_status)
-        task.signals.finished.connect(self.on_ssh_finished)
-        task.signals.error.connect(self.on_ssh_error)
-        self.thread_pool.start(task)
-
-    def on_ssh_status(self, msg: str):
-        self.ssh_status_lbl.setText(msg)
-        self.status_lbl.setText(msg)
-
-    def on_ssh_finished(self, outputs: object):
-        self.btn_run_ssh.setEnabled(True)
-        outs = list(outputs) if isinstance(outputs, list) else []
-        self.ssh_status_lbl.setText(f"SSH done: {len(outs)} output file(s).")
-        self.status_lbl.setText(self.ssh_status_lbl.text())
-        if outs:
-            QMessageBox.information(
-                self,
-                "SSH CPSAM finished",
-                f"Completed.\nSaved {len(outs)} file(s) to:\n{Path(outs[0]).parent}",
-            )
-        else:
-            QMessageBox.information(self, "SSH CPSAM finished", "Completed (no downloaded outputs).")
-
-    def on_ssh_error(self, tb: str):
-        self.btn_run_ssh.setEnabled(True)
-        self.ssh_status_lbl.setText("SSH error.")
-        self.status_lbl.setText("SSH error.")
-        QMessageBox.critical(self, "SSH CPSAM error", tb)
-
 
 def main():
     app = QApplication(sys.argv)

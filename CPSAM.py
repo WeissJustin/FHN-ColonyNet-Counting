@@ -269,6 +269,44 @@ def draw_mini_histogram(
 # CPSAM inference + overlay export
 # ------------------------------
 
+def _instance_boundaries(masks: np.ndarray, gap_px: int = 3) -> np.ndarray:
+    """
+    Return a boolean array marking the inner-contour pixels of every instance
+    that has a neighbour within gap_px pixels.
+
+    For each instance:
+      1. Dilate by gap_px — if the dilation overlaps another instance the two
+         are "adjacent".
+      2. For adjacent instances, compute the 1-pixel-wide inner contour
+         (instance mask minus a 1-px erosion).
+
+    The contour is drawn yellow ON TOP of the solid-green colony interior,
+    exactly like ColonyNet's watershed boundaries (region_mask & mx != mn),
+    so the yellow line hugs each colony edge where two colonies are close.
+    Isolated colonies get no boundary at all.
+    """
+    unique_labels = np.unique(masks)
+    unique_labels = unique_labels[unique_labels != 0]
+    if len(unique_labels) < 2:
+        return np.zeros(masks.shape, dtype=bool)
+
+    boundary = np.zeros(masks.shape, dtype=bool)
+    gap_kernel  = np.ones((2 * gap_px + 1, 2 * gap_px + 1), np.uint8)
+    edge_kernel = np.ones((3, 3), np.uint8)
+
+    for lab in unique_labels:
+        inst = (masks == lab).astype(np.uint8)
+        # Is any other instance within gap_px pixels of this one?
+        dilated = cv2.dilate(inst, gap_kernel)
+        if not np.any((dilated > 0) & (masks > 0) & (masks != lab)):
+            continue  # isolated — skip
+        # 1-px inner contour: instance edge pixels inside the colony
+        eroded = cv2.erode(inst, edge_kernel)
+        boundary |= inst.astype(bool) & ~eroded.astype(bool)
+
+    return boundary
+
+
 def run_inference(pretrained_model_path: str,
                   infer_dir: str,
                   out_dir: str,
@@ -277,20 +315,14 @@ def run_inference(pretrained_model_path: str,
                   cellprob_threshold: float,
                   min_size: int,
                   tm_threshold: int = 300,
-                  um_per_px: float | None = None,
-                  hist_metric: str = "eq_diameter_px",
-                  hist_bins: int = 24,
-                  hist_max_x: float = 300.0,
-                  hist_w: int = 720,
-                  hist_h: int = 480):
+                  um_per_px: float | None = None):
     """
     Run CPSAM inference, save overlay PNGs, and return CSV-ready result rows.
 
-    Each input image is converted to three channels, segmented with the selected
-    CPSAM model, summarized by instance area/equivalent diameter, and rendered
-    as a green-tinted overlay. The mini histogram is drawn in the top-right of
-    each overlay. CSV writing is handled by `main` so total runtime can be added
-    uniformly after inference finishes.
+    Each input image is segmented with the selected CPSAM model and rendered as
+    a solid-green colony overlay with yellow boundary lines between touching
+    instances — the same visual format used by ColonyNet, so overlays can be
+    edited interactively in the CARA app.  CSV writing is handled by `main`.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -352,64 +384,22 @@ def run_inference(pretrained_model_path: str,
                     "classes": "",
                 })
 
-        # ---- build overlay ----
+        # ---- build overlay (same format as ColonyNet) ----
         stem = Path(p).stem
         overlay_path = os.path.join(out_dir, f"{stem}_overlay.png")
 
         img8 = to_uint8(img)
         overlay = img8.copy()
 
-        # Mask tint
-        green = np.array([144, 238, 144], dtype=np.uint8)  # RGB light green
-        alpha = 0.4
-        mask_pixels = masks > 0
-        overlay[mask_pixels] = ((1 - alpha) * overlay[mask_pixels] + alpha * green).astype(np.uint8)
+        # Solid green [0, 255, 0] on all colony pixels — exact match, no blend,
+        # so app.py can reliably extract the binary mask from the PNG.
+        overlay[masks > 0] = np.array([0, 255, 0], dtype=np.uint8)
 
-        # Count text (top-left)
-        cv2.putText(
-            overlay,
-            f"Count: {count_out}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.2,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA
-        )
-
-        # Mini histogram (top-right)
-        # Gather per-colony size values for this image
-        if hist_metric == "area_px":
-            vals = np.array([r["area_px"] for r in stats], dtype=np.float32)
-            title = "Area (px)"
-        elif hist_metric == "eq_diameter_px":
-            vals = np.array([r["eq_diameter_px"] for r in stats], dtype=np.float32)
-            title = "EqDiam (px)"
-        elif hist_metric == "area_um2":
-            vals = pd_to_float_array([r["area_um2"] for r in stats])
-            title = "Area (um^2)"
-        elif hist_metric == "eq_diameter_um":
-            vals = pd_to_float_array([r["eq_diameter_um"] for r in stats])
-            title = "EqDiam (um)"
-        else:
-            # fallback
-            vals = np.array([r["eq_diameter_px"] for r in stats], dtype=np.float32)
-            title = f"{hist_metric} (fallback)"
-
-        H, W, _ = overlay.shape
-        x0 = W - hist_w - 20
-        y0 = 20
-        draw_mini_histogram(
-            overlay_rgb=overlay,
-            values=vals,
-            x0=x0,
-            y0=y0,
-            w=hist_w,
-            h=hist_h,
-            bins=hist_bins,
-            x_max=hist_max_x,
-            title=title,
-        )
+        # Yellow [255, 255, 0] on touching-instance boundary pixels — same as
+        # the watershed-style separator lines ColonyNet draws.
+        if int(masks.max()) > 1:
+            boundary = _instance_boundaries(masks)
+            overlay[boundary] = np.array([255, 255, 0], dtype=np.uint8)
 
         io.imsave(overlay_path, overlay)
 
@@ -481,13 +471,6 @@ def main():
                     help="If --skip_train, use this pretrained model path/name (default: cpsam).")
     ap.add_argument("--um_per_px", type=float, default=None,
                     help="Optional calibration: micrometers per pixel. Enables area_um2 and eq_diameter_um.")
-    ap.add_argument("--hist_metric", default="eq_diameter_px",
-                    choices=["eq_diameter_px", "area_px", "eq_diameter_um", "area_um2"],
-                    help="Metric to show as mini histogram on overlay (top-right).")
-    ap.add_argument("--hist_bins", type=int, default=24, help="Bins for mini histogram.")
-    ap.add_argument("--hist_max_x", type=float, default=300.0, help="Max x for mini histogram (values clipped).")
-    ap.add_argument("--hist_w", type=int, default=720, help="Mini histogram width in pixels.")
-    ap.add_argument("--hist_h", type=int, default=480, help="Mini histogram height in pixels.")
 
     args = ap.parse_args()
 
@@ -522,11 +505,6 @@ def main():
         min_size=args.min_size,
         tm_threshold=args.tm_threshold,
         um_per_px=args.um_per_px,
-        hist_metric=args.hist_metric,
-        hist_bins=args.hist_bins,
-        hist_max_x=args.hist_max_x,
-        hist_w=args.hist_w,
-        hist_h=args.hist_h,
     )
 
     os.makedirs(args.out_dir, exist_ok=True)

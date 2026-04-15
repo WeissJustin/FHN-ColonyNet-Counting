@@ -3,6 +3,9 @@ Colony counting logic translated from MATLAB to Python. Original code based on K
 Version: 2026-03-18
 """
 from __future__ import annotations
+import csv
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -30,6 +33,15 @@ from skimage.morphology import (
 from skimage.measure import label, regionprops, find_contours
 from skimage.segmentation import watershed
 from skimage.transform import radon, rotate
+
+
+def derive_experiment_ids_for_name(name: Union[str, Path]) -> Tuple[str, Optional[str]]:
+    stem = Path(name).stem
+    parts = stem.split("_")
+    if len(parts) >= 3 and re.search(r"dilu\d+", parts[-2], re.IGNORECASE) and re.search(r"dilu\d+", parts[-1], re.IGNORECASE):
+        prefix = "_".join(parts[:-2])
+        return f"{prefix}_{parts[-2]}", f"{prefix}_{parts[-1]}"
+    return stem, None
 
 
 
@@ -1164,6 +1176,36 @@ def _crop_to_nonzero_bbox(rgb: np.ndarray, pad: int = 2) -> np.ndarray:
     return rgb[y0:y1, x0:x1].copy()
 
 
+def _looks_pre_cropped(rgb: np.ndarray) -> bool:
+    if rgb.size == 0:
+        return False
+    m = np.any(rgb != 0, axis=2) if rgb.ndim == 3 else (rgb != 0)
+    h, w = m.shape
+    if h < 16 or w < 16:
+        return False
+
+    nz_frac = float(np.count_nonzero(m)) / float(m.size)
+    if nz_frac <= 0.02 or nz_frac >= 0.995:
+        return False
+
+    bw = max(4, int(round(min(h, w) * 0.02)))
+    border = np.zeros_like(m, dtype=bool)
+    border[:bw, :] = True
+    border[-bw:, :] = True
+    border[:, :bw] = True
+    border[:, -bw:] = True
+
+    border_zero_frac = float(np.count_nonzero(~m[border])) / float(np.count_nonzero(border))
+    edge_touch_fracs = [
+        float(np.mean(m[:bw, :])),
+        float(np.mean(m[-bw:, :])),
+        float(np.mean(m[:, :bw])),
+        float(np.mean(m[:, -bw:])),
+    ]
+    max_edge_touch = max(edge_touch_fracs)
+
+    return border_zero_frac >= 0.25 and max_edge_touch >= 0.10
+
 def _get_expts_from_detectdish(
     rgb: np.ndarray,
     dish_mode: str,
@@ -1180,7 +1222,9 @@ def _get_expts_from_detectdish(
       - 'auto': same as 'double' but falls back to 1 expt if no divider found
     """
     if dish_mode == "pre_cropped":
-        return [{"expt": rgb}]
+        return [{"expt": _crop_to_nonzero_bbox(rgb)}]
+    if dish_mode == "auto" and _looks_pre_cropped(rgb):
+        return [{"expt": _crop_to_nonzero_bbox(rgb)}]
 
     # Lazy import so the rest of the file can be imported without DetectDish installed.
     import DetectDish  # your improved dish detector script/module
@@ -1201,7 +1245,7 @@ def _get_expts_from_detectdish(
         return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
 
     # Auto/double: attempt to find divider + split
-    y_split = DetectDish.find_divider_y(
+    bar_extents = DetectDish.find_divider_y(
         brightness,
         ellipse_final,
         bar_q=DetectDish.BAR_Q,
@@ -1210,23 +1254,46 @@ def _get_expts_from_detectdish(
         max_thick=DetectDish.BAR_MAX_THICK_PX,
     )
 
-    if y_split is None:
+    if bar_extents is None:
         # no divider found -> one dish
         return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
 
+    y0_bar, y1_bar = bar_extents
     top_bgr, bot_bgr = DetectDish.mask_top_bottom(
         image_bgr=bgr,
         ellipse=ellipse_final,
-        y_split=y_split,
-        gap=DetectDish.BAR_SPLIT_MARGIN_PX,
+        y_bar_top=y0_bar,
+        y_bar_bot=y1_bar,
+        margin=DetectDish.BAR_SPLIT_MARGIN_PX,
     )
     top_rgb = cv2.cvtColor(top_bgr, cv2.COLOR_BGR2RGB)
     bot_rgb = cv2.cvtColor(bot_bgr, cv2.COLOR_BGR2RGB)
 
-    expts = [{"expt": _crop_to_nonzero_bbox(top_rgb)}, {"expt": _crop_to_nonzero_bbox(bot_rgb)}]
+    top_crop = _crop_to_nonzero_bbox(top_rgb)
+    bot_crop = _crop_to_nonzero_bbox(bot_rgb)
 
-    # If user forced double, keep 2; if auto, keep 2 as well (since divider found)
-    return expts
+    # ------------------------------------------------------------------
+    # Validate the split: each half must own a meaningful fraction of the
+    # total dish area.  A genuine half-dish produces two halves of roughly
+    # equal size (each ≈ 35–50 %).  A false-positive divider on a full
+    # dish yields one tiny sliver and one nearly-full region.
+    #
+    # If either half is below the threshold, discard the split and return
+    # the whole dish as a single experiment.
+    # ------------------------------------------------------------------
+    _MIN_HALF_FRAC = 0.20  # each half must be ≥ 20 % of total dish
+
+    total_dish_nz = float(np.count_nonzero(np.any(masked_rgb > 0, axis=2)))
+    if total_dish_nz > 0:
+        top_nz = float(np.count_nonzero(np.any(top_crop > 0, axis=2)))
+        bot_nz = float(np.count_nonzero(np.any(bot_crop > 0, axis=2)))
+        top_frac = top_nz / total_dish_nz
+        bot_frac = bot_nz / total_dish_nz
+        if top_frac < _MIN_HALF_FRAC or bot_frac < _MIN_HALF_FRAC:
+            # Split is lopsided → false divider on a full dish
+            return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+
+    return [{"expt": top_crop}, {"expt": bot_crop}]
 
 def _count_one_expt_full_logic(
     expt: np.ndarray,
@@ -1414,12 +1481,20 @@ def count_cfu_app(
 
     out_paths: List[str] = []
 
+    n_expts = len(expts)
     for k, item in enumerate(expts, start=1):
+        if n_expts >= 2 and k == 2 and not bot_cell:
+            continue
         expt = item["expt"]
         _, _, _, _, out_image, _, _ = _count_one_expt_full_logic(expt, k, params=params)
 
         # Save TIFFs (no .mat)
-        expt_id = top_cell if k == 1 else bot_cell
+        if n_expts >= 2:
+            expt_id = top_cell if k == 1 else bot_cell
+        else:
+            # Single / full dish: keep the unsuffixed stem so mixed folders
+            # behave the same as CountCFUAPP2.
+            expt_id = top_cell.removesuffix("_Top") if top_cell.endswith("_Top") else top_cell
         base = folder_dir / version / expt_id
 
         if save_which in ("overlay", "both"):
@@ -1433,6 +1508,99 @@ def count_cfu_app(
             out_paths.append(str(expt_tif))
 
     return out_paths
+
+
+def _predict_test_rows(
+    rgb: np.ndarray,
+    image_name: str,
+    dish_mode: str = "auto",
+    target_area_px2: float = 2245000.0,
+    params: Optional[TuningParams] = None,
+) -> List[Dict[str, Any]]:
+    params = params or TuningParams()
+    expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
+    rows: List[Dict[str, Any]] = []
+    image_stem = Path(image_name).stem
+    top_id, bot_id = derive_experiment_ids_for_name(image_name)
+    n_expts = len(expts)
+
+    for k, item in enumerate(expts, start=1):
+        expt = item["expt"]
+        if n_expts >= 2:
+            if k == 2 and not bot_id:
+                continue
+            petri_dish = top_id if k == 1 else bot_id
+        else:
+            petri_dish = image_stem
+
+        features = predict_tuning_features(
+            expt,
+            dish_mode="pre_cropped",
+            target_area_px2=float(target_area_px2),
+            params=params,
+        )
+
+        count = int(features.get("count", 0))
+        instance_areas = [float(a) for a in features.get("instance_areas", [])]
+        methods = ",".join(str(v) for v in features.get("methods", []))
+        classes = ",".join(str(v) for v in features.get("classes", []))
+        mean_area = float(features.get("mean_area", 0.0))
+
+        if not instance_areas:
+            rows.append(
+                {
+                    "image_name": image_name,
+                    "petri_dish": petri_dish,
+                    "dish_index": k,
+                    "count": count,
+                    "cfu_index": "",
+                    "cfu_area_px": "",
+                    "mean_area_px": mean_area,
+                    "methods": methods,
+                    "classes": classes,
+                }
+            )
+            continue
+
+        for i, area in enumerate(instance_areas, start=1):
+            rows.append(
+                {
+                    "image_name": image_name,
+                    "petri_dish": petri_dish,
+                    "dish_index": k,
+                    "count": count,
+                    "cfu_index": i,
+                    "cfu_area_px": area,
+                    "mean_area_px": mean_area,
+                    "methods": methods,
+                    "classes": classes,
+                }
+            )
+
+    return rows
+
+
+def _write_test_csv(rows: List[Dict[str, Any]], outdir: Path) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    csv_path = outdir / "countCFUAPP_test_results.csv"
+    fieldnames = [
+        "image_name",
+        "petri_dish",
+        "dish_index",
+        "count",
+        "cfu_index",
+        "cfu_area_px",
+        "mean_area_px",
+        "methods",
+        "classes",
+        "total_runtime_sec",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return csv_path
 
 
 # ----------------------------
@@ -1451,6 +1619,7 @@ if __name__ == "__main__":
     import argparse
     import cv2
     from pathlib import Path
+    t0_total = time.perf_counter()
 
     parser = argparse.ArgumentParser(description="Run CFU counter on a single image")
     parser.add_argument("--image", help="Input image (png/jpg/tif)")
@@ -1464,6 +1633,8 @@ if __name__ == "__main__":
     # Output
     parser.add_argument("--save_which", default="overlay", choices=["overlay", "expt", "both"],
                         help="Save overlay TIFF, cropped dish TIFF, or both")
+    parser.add_argument("--Test", action="store_true",
+                        help="Write a CSV in outdir with per-petridish counts and per-CFU areas")
     args = parser.parse_args()
 
     input_path = Path(args.image)
@@ -1471,6 +1642,8 @@ if __name__ == "__main__":
     if not image_files:
         raise RuntimeError(f"No images found at: {input_path}")
 
+    all_paths: List[str] = []
+    test_rows: List[Dict[str, Any]] = []
     for img_path in image_files:
         img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -1479,10 +1652,11 @@ if __name__ == "__main__":
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         stem = img_path.stem
+        top_id, bot_id = derive_experiment_ids_for_name(img_path.name)
         out_paths = count_cfu_app(
             rgb=img,
-            top_cell=stem,               # if split -> top uses stem, bottom uses stem + "_Bottom"
-            bot_cell=stem + "_Bottom",
+            top_cell=top_id,
+            bot_cell=bot_id or "",
             folder_dir=args.outdir,
             version=args.version,
             index=Path(args.image).name,
@@ -1491,7 +1665,23 @@ if __name__ == "__main__":
             save_which=args.save_which,
             params=None
         )
-    for p in out_paths:
+        all_paths.extend(list(out_paths))
+        if args.Test:
+            test_rows.extend(
+                _predict_test_rows(
+                    rgb=img,
+                    image_name=img_path.name,
+                    dish_mode=args.dish_mode,
+                    target_area_px2=args.target_area_px2,
+                    params=None,
+                )
+            )
+    for p in all_paths:
         print(p)
-
-
+    if args.Test:
+        total_runtime_sec = float(time.perf_counter() - t0_total)
+        for row in test_rows:
+            row["total_runtime_sec"] = total_runtime_sec
+        csv_path = _write_test_csv(test_rows, Path(args.outdir))
+        print(csv_path)
+        print(f"[OK] Total runtime: {total_runtime_sec:.3f} s")

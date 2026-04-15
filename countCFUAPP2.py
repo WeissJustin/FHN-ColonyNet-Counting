@@ -69,6 +69,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -111,7 +112,8 @@ class TuningParams:
     hsv_extent_min: float = 0.23
     hsv_open_disk_small: int = 1
     hsv_open_disk_large: int = 16
-    min_object_area: int = 150
+    hsv_close_disk_large: int = 10  # per-blob closing radius for large blobs (area >= 8000)
+    min_object_area: int = 90
     small_area_quantile: float = 0.75
     small_cluster_extent_min: float = 0.20
     nonsmall_cluster_ecc_min: float = 0.99
@@ -121,6 +123,58 @@ class TuningParams:
     ws_gauss_sigma: float = 0.3
     uncountable_cutoff: int = 300
     uncountable_precheck_cutoff: int = 400
+
+
+CLASS_LARGE_THRESH = 0.0043
+CLASS_MEDIUM_THRESH = 0.0032
+CLASS_HIGH_GRAD_LARGE_MULT = 15.0
+CLASS_HIGH_GRAD_LARGE_ABS_MIN = 170_000.0
+
+
+# ---------------------------------------------------------------------------
+# Pre-set parameter profiles
+# ---------------------------------------------------------------------------
+# Default TuningParams() is tuned for small colonies (E. coli-scale, many per dish).
+# Large-CFU mode handles fungi, slow growers, or low-dilution plates where
+# colonies are large (radius 40–120 px), sparse, and their halos fool the
+# adaptive-V calibration loop into over-tightening.
+#
+# Key differences vs. default:
+#   hsv_err_tol  : 0.0061 → 0.04  — large colony halos look like "FP" to the
+#                                    loop; must be far more lenient or V is
+#                                    tightened until almost nothing is kept.
+#   h_ref_frac   : 0.12 → 0.08    — smaller h → imextendedmin captures more of
+#                                    each colony → fewer halo pixels counted as FP.
+#   hsv_v_start  : 0.3 → 0.55     — large colonies may be bright-ringed; start
+#                                    more liberal so the loop has room to work.
+#   hsv_v_min    : 0.35 → 0.20    — allow V to fall further if needed.
+#   min_object_area: 150 → 1500   — suppress agar noise while keeping large colonies.
+#   uncountable_*: lowered         — 30 large colonies can already be TNTC.
+
+LARGE_CFU_PARAMS = TuningParams(
+hsv_v_start=0.635,
+hsv_v_step=0.05,
+hsv_v_min=0.35,
+hsv_s_min=0.00,
+hsv_err_tol=0.20,          # large colonies on dark agar have ~22% FP floor;
+                            # tighter values can't converge and prevent detection
+h_ref_frac=0.12,
+hsv_extent_min=0.23,
+hsv_open_disk_small=3,
+hsv_open_disk_large=30,    # larger opening suppresses agar-texture noise better
+hsv_close_disk_large=15,   # larger closing bridges wider holes inside large CFUs
+min_object_area=100,       # raise floor to filter small agar-noise blobs
+small_area_quantile=0.75,
+small_cluster_extent_min=0.20,
+nonsmall_cluster_ecc_min=0.99,
+nonsmall_cluster_extent_min=0.20,
+colony_circularity_min=0.09,
+ws_thresh_abs_frac=0.05,
+ws_gauss_sigma=1.0,
+uncountable_cutoff=300,
+uncountable_precheck_cutoff=400,
+)
+
 
 
 @dataclass
@@ -532,6 +586,25 @@ def _crop_to_nonzero_bbox(rgb: np.ndarray, pad: int = 2) -> np.ndarray:
     return rgb[y0:y1, x0:x1].copy()
 
 
+def derive_experiment_ids_for_name(name: Union[str, Path]) -> Tuple[str, Optional[str]]:
+    """
+    Return output IDs for a possible top/bottom pair name.
+
+    Pair example:
+      DIFIP1_1229Edilu3_1230Edilu3.tif
+      -> ("DIFIP1_1229Edilu3", "DIFIP1_1230Edilu3")
+
+    Single-name inputs return no bottom ID; if a false split happens later, the
+    lower half is ignored instead of being saved as a misleading *_Bottom file.
+    """
+    stem = Path(name).stem
+    parts = stem.split("_")
+    if len(parts) >= 3 and re.search(r"dilu\d+", parts[-2], re.IGNORECASE) and re.search(r"dilu\d+", parts[-1], re.IGNORECASE):
+        prefix = "_".join(parts[:-2])
+        return f"{prefix}_{parts[-2]}", f"{prefix}_{parts[-1]}"
+    return stem, None
+
+
 def _looks_pre_cropped(rgb: np.ndarray) -> bool:
     if rgb.size == 0:
         return False
@@ -824,8 +897,10 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
     # Strategy: for each blob independently dilate → fill → erode back.
     # Adaptive kernel radius: small blobs are likely thin arc remnants with
     # wide gaps (20-30 px); they need a larger disk to bridge the gap.
-    # Large blobs are mostly solid; disk(4) is sufficient and avoids over-
-    # expanding neighbours.  Per-blob processing prevents merging.
+    # Large blobs (area >= 8000) may have internal holes with thin channels
+    # to the background; hsv_close_disk_large (default 10, 15 for large-CFU
+    # mode) must be wide enough to seal those channels so fill_holes works.
+    # Per-blob processing prevents merging of neighbouring colonies.
     bw_labeled, n_blobs = ndi.label(bw)
     bw_repaired = np.zeros_like(bw)
     blob_areas = np.bincount(bw_labeled.ravel())
@@ -836,7 +911,7 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
             continue
         label_i = i + 1
         area = int(blob_areas[label_i])
-        r = 12 if area < 1500 else (6 if area < 8000 else 4)
+        r = 12 if area < 1500 else (6 if area < 8000 else int(params.hsv_close_disk_large))
         # Pad the bounding box by r so dilation/erosion have enough room.
         # Operating on the padded crop instead of the full image reduces cost
         # from O(H×W) to O((blob_bbox + 2r)²) — ~100–1000× faster per blob.
@@ -1065,6 +1140,7 @@ def _expand_mask_to_dark_colony_halos(
     expt_rgb: np.ndarray,
     gray_expt: np.ndarray,
     dish_area: int,
+    large_cfu_mode: bool = False,
 ) -> np.ndarray:
     """
     Grow accepted CFU cores into the surrounding dark colony footprint for
@@ -1090,18 +1166,22 @@ def _expand_mask_to_dark_colony_halos(
     if vals.size < 100:
         return bw_clean
 
-    contrast_thr = float(np.clip(np.percentile(vals, 66), 5.0, 14.0))
+    contrast_pct = 58 if large_cfu_mode else 66
+    contrast_thr = float(np.clip(np.percentile(vals, contrast_pct), 4.0, 14.0))
     dark_candidate = dish_mask & (dark_contrast >= contrast_thr)
 
     nz = gray_expt[dish_mask]
     if nz.size >= 100:
         gray_med = float(np.median(nz))
-        gray_thr = float(np.percentile(nz, 42))
+        gray_pct = 50 if large_cfu_mode else 42
+        gray_thr = float(np.percentile(nz, gray_pct))
         if gray_thr < gray_med - 5.0:
             dark_candidate |= dish_mask & (gray_expt.astype(np.float32) <= gray_thr)
 
     coverage = float(np.count_nonzero(bw_clean)) / dish_area if dish_area > 0 else 0.0
-    if coverage > 0.15:
+    if large_cfu_mode:
+        grow_r = 48 if coverage <= 0.08 else 24
+    elif coverage > 0.15:
         grow_r = 4
     elif coverage > 0.10:
         grow_r = 8
@@ -1157,7 +1237,10 @@ def _expand_mask_to_dark_colony_halos(
             if seed_area <= 0:
                 continue
             comp_area = int(reg.area)
-            max_area = int(max(seed_area * 9, seed_area + 2500))
+            if large_cfu_mode:
+                max_area = int(max(seed_area * 16, seed_area + 8000))
+            else:
+                max_area = int(max(seed_area * 9, seed_area + 2500))
             if comp_area <= max_area:
                 capped |= comp
                 continue
@@ -1169,6 +1252,133 @@ def _expand_mask_to_dark_colony_halos(
             capped[rr[keep_idx], cc[keep_idx]] = True
         expanded = capped
     return expanded
+
+
+def _remove_edge_bar_artifacts(bw: np.ndarray) -> np.ndarray:
+    """
+    Remove only very bar-like components touching the top/bottom crop edge.
+    This targets divider remnants in half dishes without filtering central
+    elongated CFU clusters.
+    """
+    bw = bw.astype(bool)
+    if not np.any(bw):
+        return bw
+    h, w = bw.shape
+    edge_px = max(6, int(round(0.025 * min(h, w))))
+    lab = label(bw, connectivity=2)
+    out = bw.copy()
+    for reg in regionprops(lab):
+        minr, minc, maxr, maxc = reg.bbox
+        comp_h = int(maxr - minr)
+        comp_w = int(maxc - minc)
+        if comp_h <= 0 or comp_w <= 0:
+            continue
+        touches_horizontal_edge = minr <= edge_px or maxr >= h - edge_px
+        if not touches_horizontal_edge:
+            continue
+        aspect = comp_w / max(1.0, float(comp_h))
+        very_wide_band = comp_w >= int(0.08 * w) and aspect >= 3.0
+        long_thin = (
+            float(reg.eccentricity) >= 0.985
+            and comp_w >= int(0.05 * w)
+            and float(reg.extent) <= 0.55
+        )
+        if very_wide_band or long_thin:
+            out[lab == reg.label] = False
+    return out
+
+
+def _has_dark_object_probe(expt: np.ndarray, params: TuningParams) -> bool:
+    gray = _gray_uint8(cv2.GaussianBlur(expt, (0, 0), 2))
+    if not np.any(gray != 0):
+        return False
+    thr, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    probe = (gray < thr) & (gray != 0)
+    probe = bwareaopen(probe, max(25, int(params.min_object_area)))
+    probe = bwpropfilt(probe, "Extent", (0.15, 1.0))
+    probe = _remove_edge_bar_artifacts(probe)
+    return bool(np.any(probe))
+
+
+def _identify_border_pixels(window_u8: np.ndarray) -> int:
+    w = np.asarray(window_u8).ravel()
+    if w.size == 0:
+        return 0
+    ctr = w[w.size // 2]
+    if ctr == 0 or ctr >= 250:
+        return 0
+    return int(np.count_nonzero(w >= 250) > 1)
+
+
+def _identify_high_bdry_pixels(window_u8: np.ndarray) -> int:
+    w = np.asarray(window_u8).ravel()
+    if w.size == 0:
+        return 0
+    ctr = w[w.size // 2]
+    if ctr == 0:
+        return 0
+    return int(np.count_nonzero(w) > 2)
+
+
+def _gradient_hist_size_guess(gray_expt: np.ndarray) -> Tuple[str, float, float, float]:
+    """
+    First size guess from APP1's blur + Laplacian histogram signal.
+
+    Returns (class, max_hist_bin_count, medium_threshold, large_threshold).
+    """
+    if gray_expt is None or gray_expt.size == 0:
+        return "small", 0.0, 0.0, 0.0
+
+    gray_expt = _gray_uint8(gray_expt)
+    blur = cv2.GaussianBlur(
+        gray_expt, (3, 3),
+        sigmaX=0.5, sigmaY=0.5,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    im_grad = np.abs(cv2.Laplacian(
+        blur, cv2.CV_32F, ksize=3,
+        borderType=cv2.BORDER_REPLICATE,
+    ))
+
+    border_grad = (im_grad >= 250).astype(np.uint8)
+    border_grad2 = ndi.generic_filter(
+        border_grad,
+        function=_identify_high_bdry_pixels,
+        size=(3, 3),
+        mode="nearest",
+    )
+    im_grad_final = im_grad.astype(np.float32) * (1.0 - border_grad2.astype(np.float32))
+
+    border_med = ndi.generic_filter(
+        im_grad,
+        function=_identify_border_pixels,
+        size=(3, 3),
+        mode="nearest",
+    )
+    im_grad_final = im_grad_final * (1.0 - border_med.astype(np.float32))
+
+    vals = np.sort(im_grad_final.reshape(-1))
+    vals = vals[vals > 5]
+    if vals.size == 0:
+        vals = np.array([6.0], dtype=np.float32)
+
+    bins = np.arange(float(vals.min()), float(vals.max()) + 5.0, 5.0)
+    hist, _ = np.histogram(vals, bins=bins)
+
+    sz_total = float(gray_expt.shape[0] * gray_expt.shape[1])
+    large_check = sz_total * CLASS_LARGE_THRESH
+    medium_check = sz_total * CLASS_MEDIUM_THRESH
+    max_val = float(hist.max()) if hist.size else 0.0
+    high_grad_large_check = max(
+        large_check * CLASS_HIGH_GRAD_LARGE_MULT,
+        CLASS_HIGH_GRAD_LARGE_ABS_MIN,
+    )
+
+    if max_val < large_check or max_val >= high_grad_large_check:
+        return "large", max_val, medium_check, large_check
+    if medium_check < max_val < large_check:
+        return "medium", max_val, medium_check, large_check
+    return "small", max_val, medium_check, large_check
 
 
 def _count_colonies_with_instances(
@@ -1329,6 +1539,7 @@ def _count_one_expt_hsv(
     num_cfu, method, size_class, mean_area, out_image, colony_roi, cluster_roi,
     bw_raw (raw HSV mask before morpho_cleanup, as uint8 RGB for saving)
     """
+    _auto_adapt = params is None
     params = params or TuningParams()
 
     # --- BLOCK 1: preprocess ---
@@ -1339,18 +1550,35 @@ def _count_one_expt_hsv(
     gray0 = _gray_uint8(expt_blur)
     bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
     bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
-    if not np.any(bw_min0):
+    if not np.any(bw_min0) and not _has_dark_object_probe(expt, params):
         return 0, "Zero", "Zero", 0.0, expt, [], [], np.zeros((*expt.shape[:2], 3), dtype=np.uint8)
 
     # --- Uncountable fast-check (Otsu on raw gray, same as original) ---
     gray_unc = _gray_uint8(expt)
-    _, thr = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr, _ = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     bw_unc = (gray_unc < thr) & (gray_unc != 0)
-    num_unc, _, _, _, _ = _count_colonies_with_instances(
-        bw_unc, expt, params, build_overlay=False, build_rois=False
+    bw_unc = _remove_edge_bar_artifacts(bw_unc)
+    num_unc, unc_overlay, _, _, _ = _count_colonies_with_instances(
+        bw_unc, expt, params, build_overlay=True, build_rois=False
     )
     if num_unc > int(params.uncountable_precheck_cutoff):
-        return int(num_unc), "Uncountable", "Uncountable", 0.0, np.array([]), [], [], np.zeros((*expt.shape[:2], 3), dtype=np.uint8)
+        bw_unc_rgb = cv2.cvtColor((bw_unc.astype(np.uint8) * 255), cv2.COLOR_GRAY2RGB)
+        return int(num_unc), "Uncountable", "Uncountable", _mean_region_area(bw_unc), unc_overlay, [], [], bw_unc_rgb
+
+    # --- Auto size-adapt: switch to large-CFU params if needed ---
+    # Use APP1's blur + Laplacian gradient histogram as the first size guess.
+    if _auto_adapt:
+        _cfu_class, _grad_max, _medium_check, _large_check = _gradient_hist_size_guess(gray_expt)
+        if _cfu_class == "large":
+            params = LARGE_CFU_PARAMS
+            print(f"  [expt {k}] size-adapt → large-CFU mode "
+                  f"(gradient max {_grad_max:.1f}; large if max < {_large_check:.1f} "
+                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
+        else:
+            print(f"  [expt {k}] size-adapt → {_cfu_class}-CFU mode "
+                  f"(gradient max {_grad_max:.1f}; medium if max > {_medium_check:.1f}, "
+                  f"large if max < {_large_check:.1f} "
+                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
 
     # --- BLOCK 2: adaptive HSV mask ---
     bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
@@ -1390,6 +1618,7 @@ def _count_one_expt_hsv(
     # watershed. This keeps the green fill, post mask, and yellow split
     # boundaries in the same geometry.
     bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
+    bw_segment = _remove_edge_bar_artifacts(bw_segment)
 
     # --- BLOCKS 4+5+6: candidate filtering + watershed + count/ROI ---
     # Pass the ORIGINAL (non-preprocessed) image so the green overlay lands
@@ -1400,7 +1629,8 @@ def _count_one_expt_hsv(
 
     # Hard ceiling (same as original)
     if num_cfu > int(params.uncountable_cutoff):
-        return int(num_cfu), "Uncountable", "Uncountable", 0.0, np.array([]), [], [], np.zeros((*expt.shape[:2], 3), dtype=np.uint8)
+        bw_post_rgb = cv2.cvtColor((bw_segment.astype(np.uint8) * 255), cv2.COLOR_GRAY2RGB)
+        return int(num_cfu), "Uncountable", "Uncountable", _mean_region_area(bw_segment), out_image, colony_roi, cluster_roi, bw_post_rgb
 
     mean_area = _mean_region_area(bw_segment)
 
@@ -1439,12 +1669,13 @@ def predict_count_only_hsv(
         gray0 = _gray_uint8(expt_blur)
         bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
         bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
-        if not np.any(bw_min0):
+        if not np.any(bw_min0) and not _has_dark_object_probe(expt, params):
             continue
 
         gray_unc = _gray_uint8(expt)
-        _, thr = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thr, _ = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         bw_unc = (gray_unc < thr) & (gray_unc != 0)
+        bw_unc = _remove_edge_bar_artifacts(bw_unc)
         num_unc, _, _, _, _ = _count_colonies_with_instances(
             bw_unc, expt, params, build_overlay=False, build_rois=False
         )
@@ -1462,6 +1693,7 @@ def predict_count_only_hsv(
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
         bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
         bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
+        bw_segment = _remove_edge_bar_artifacts(bw_segment)
 
         num_cfu, _, _, _, _ = _count_colonies_with_instances(
             bw_segment, expt, params, build_overlay=False, build_rois=False
@@ -1493,7 +1725,8 @@ def predict_tuning_features(
         classes        : list[str]   — size class per expt
         mean_area      : float       — mean colony area across countable expts
     """
-    params = params or TuningParams()
+    _large_override = params
+    _small_params = TuningParams()
     expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
 
     total_count = 0
@@ -1501,31 +1734,50 @@ def predict_tuning_features(
     mean_areas: List[float] = []
     methods: List[str] = []
     classes: List[str] = []
+    _binary_parts: List[np.ndarray] = []
 
     for k, item in enumerate(expts, start=1):
         expt = item["expt"]
+        _large_cfu_mode = False
 
         # --- BLOCK 1: preprocess ---
         expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat)
+
+        # --- Size-adapt: keep small params fixed, override only large mode ---
+        _cfu_class, _grad_max, _medium_check, _large_check = _gradient_hist_size_guess(gray_expt)
+        if _cfu_class == "large":
+            params = _large_override or LARGE_CFU_PARAMS
+            _large_cfu_mode = True
+            print(f"  [expt {k}] size-adapt → large-CFU mode "
+                  f"(gradient max {_grad_max:.1f}; large if max < {_large_check:.1f} "
+                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
+        else:
+            params = _small_params
+            print(f"  [expt {k}] size-adapt → {_cfu_class}-CFU mode "
+                  f"(gradient max {_grad_max:.1f}; medium if max > {_medium_check:.1f}, "
+                  f"large if max < {_large_check:.1f} "
+                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
 
         # --- Zero-CFU fast-check ---
         expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
         gray0 = _gray_uint8(expt_blur)
         bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
         bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
-        if not np.any(bw_min0):
+        if not np.any(bw_min0) and not _has_dark_object_probe(expt, params):
             methods.append("Zero")
             classes.append("Zero")
             continue
 
         # --- Uncountable fast-check (Otsu on raw gray) ---
         gray_unc = _gray_uint8(expt)
-        _, thr = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thr, _ = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         bw_unc = (gray_unc < thr) & (gray_unc != 0)
+        bw_unc = _remove_edge_bar_artifacts(bw_unc)
         num_unc, _, _, _, inst_unc = _count_colonies_with_instances(
             bw_unc, expt, params, build_overlay=False, build_rois=False
         )
         if num_unc > int(params.uncountable_precheck_cutoff):
+            _binary_parts.append(bw_unc)
             total_count += int(num_unc)
             _, cnts = np.unique(inst_unc[inst_unc > 0], return_counts=True)
             all_instance_areas.extend(float(c) for c in cnts)
@@ -1548,7 +1800,12 @@ def predict_tuning_features(
 
         # --- Second pass: recover blobs lost in morpho_cleanup on sparse plates ---
         bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
-        bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
+        bw_segment = _expand_mask_to_dark_colony_halos(
+            bw_clean, expt, gray_expt, dish_area,
+            large_cfu_mode=_large_cfu_mode,
+        )
+        bw_segment = _remove_edge_bar_artifacts(bw_segment)
+        _binary_parts.append(bw_segment)
 
         # --- BLOCKS 4+5+6: count + instance labels ---
         num_cfu, _, _, _, inst_labels = _count_colonies_with_instances(
@@ -1580,12 +1837,31 @@ def predict_tuning_features(
         classes.append(size_class)
         methods.append("HSV")
 
+    # Merge per-expt binary masks.  For single-expt (pre_cropped) images
+    # there is exactly one part; for multi-expt we OR them at the first
+    # part's resolution (approximate but sufficient for a spatial Dice check).
+    if _binary_parts:
+        combined_binary = _binary_parts[0].copy()
+        for _part in _binary_parts[1:]:
+            if _part.shape == combined_binary.shape:
+                combined_binary |= _part
+            else:
+                _part_rs = cv2.resize(
+                    _part.astype(np.uint8),
+                    (combined_binary.shape[1], combined_binary.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+                combined_binary |= _part_rs
+    else:
+        combined_binary = np.zeros(rgb.shape[:2], dtype=bool)
+
     return {
         "count": total_count,
         "instance_areas": all_instance_areas,
         "methods": methods,
         "classes": classes,
         "mean_area": float(np.mean(mean_areas)) if mean_areas else 0.0,
+        "binary_mask": combined_binary,
     }
 
 
@@ -1615,7 +1891,9 @@ def count_cfu_app2(
       double      — try top/bottom split; fall back to 1 if no divider
       auto        — same as double
     """
-    params = params or TuningParams()
+    # Do NOT resolve params here — pass None through so _count_one_expt_hsv
+    # can detect it and apply the automatic large/small-CFU size adaptation.
+    # If the caller supplied explicit params, they are passed through unchanged.
     folder_dir = Path(folder_dir)
     folder_dir.mkdir(parents=True, exist_ok=True)
     (folder_dir / version).mkdir(parents=True, exist_ok=True)
@@ -1627,6 +1905,8 @@ def count_cfu_app2(
 
     n_expts = len(expts)
     for k, item in enumerate(expts, start=1):
+        if n_expts >= 2 and k == 2 and not bot_cell:
+            continue
         expt = item["expt"]
         num_cfu, _, _, _, out_image, _, _, bw_post_rgb = _count_one_expt_hsv(
             expt, k, use_blackhat=use_blackhat, params=params, build_rois=False
@@ -1677,12 +1957,15 @@ def _predict_test_rows(
     expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
     rows: List[Dict[str, Any]] = []
     image_stem = Path(image_name).stem
+    top_id, bot_id = derive_experiment_ids_for_name(image_name)
     n_expts = len(expts)
 
     for k, item in enumerate(expts, start=1):
         expt = item["expt"]
         if n_expts >= 2:
-            petri_dish = image_stem if k == 1 else f"{image_stem}_Bottom"
+            if k == 2 and not bot_id:
+                continue
+            petri_dish = top_id if k == 1 else bot_id
         else:
             petri_dish = image_stem
 
@@ -1800,6 +2083,7 @@ if __name__ == "__main__":
     test_rows: List[Dict[str, Any]] = []
     csv_path = None
     for img_path in image_files:
+        print(f"[input] {img_path.name}", flush=True)
         img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
             print(f"[skip] Cannot read {img_path}")
@@ -1807,10 +2091,11 @@ if __name__ == "__main__":
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         stem = img_path.stem
+        top_id, bot_id = derive_experiment_ids_for_name(img_path.name)
         paths = count_cfu_app2(
             rgb=img,
-            top_cell=stem,
-            bot_cell=stem + "_Bottom",
+            top_cell=top_id,
+            bot_cell=bot_id or "",
             folder_dir=args.outdir,
             version=args.version,
             index=None,

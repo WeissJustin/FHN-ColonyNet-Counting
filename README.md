@@ -31,7 +31,7 @@ Both methods operate in parallel with outputs combined via a hybrid strategy to 
 
 ## Documentation
 
-FHN-ColonyNet-Counting/
+FHN-ColonyNet-Counting/ <br>
 ├── app.py                          # Main application - executes all algorithms <br>
 ├── CARA.py                         # Classical computer vision (CARA) implementation <br>
 ├── CPSAM.py                        # Transformer-based segmentation algorithm <br>
@@ -40,11 +40,11 @@ FHN-ColonyNet-Counting/
 │                                   #   - Algorithm methodology <br>
 │                                   #   - Performance metrics & analysis <br>
 │                                   #   - Usage instructions <br>
-│                                   #   - Implementation details
-├── environment.yml                 # Conda Environment Setup
-├── README.md                       # Project overview
-├── input/                          # Input petri dish images
-└── output/                         # Generated counts & visualizations
+│                                   #   - Implementation details  <br>
+├── environment.yml                 # Conda Environment Setup <br>
+├── README.md                       # Project overview <br>
+├── input/                          # Input petri dish images <br>
+└── output/                         # Generated counts & visualizations <br>
 
 ## Installation
 

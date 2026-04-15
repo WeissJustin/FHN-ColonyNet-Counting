@@ -1,28 +1,51 @@
-<h1>🧫 FHN-ColonyNet-Counting</h1>
+# 🧫 FHN-ColonyNet-Counting
 
-<h2>Overview</h2>
-<p>
-FHN-ColonyNet-Counting is a hybrid framework for accurate bacterial colony detection and counting.
-It integrates advanced algorithmic components to ensure robust and adaptable performance.
-</p>
+A hybrid framework for automated bacterial colony detection and counting from petri dish imagery.
 
-<h2>Methodology</h2>
-<ul>
-  <li><strong>CPSAM</strong>: Generates candidate regions and refines detections using SAM based model.</li>
-  <li><strong>CARA</strong>: Uses classical computer vision to generate first guesses.</li>
-</ul>
+## Overview
 
-<h2>Features</h2>
-<ul>
-  <li>Automated colony detection and counting</li>
-  <li>Hybrid detection + refinement pipeline</li>
-  <li>Robust across varying image conditions</li>
-  <li>Modular and extensible design</li>
-</ul>
+FHN-ColonyNet-Counting enables automatic quantification of colony-forming units (CFUs) from bacterial imaging data through a hybrid framework combining two complementary algorithms. This approach maximizes segmentation performance while mitigating the limitations inherent to each individual method.
 
-<h2>Getting Started</h2>
-<pre>
-git clone https://github.com/your-username/FHN-ColonyNet-Counting.git
-cd FHN-ColonyNet-Counting
-pip install -r requirements.txt
-</pre>
+The complete application integrates both local and server-based processing via the FHN ColonyNet application, which manages CPSAM inference on a remote server and CARA execution locally.
+
+**For technical issues or server access, contact:** justin.weiss@hotmail.ch
+
+## Methodology
+
+The framework combines two complementary segmentation approaches:
+
+- **CPSAM**: A transformer-based segmentation model combining Cellpose and Segment Anything Model (SAM) architectures. Uses a SAM-based Vision Transformer encoder coupled with Cellpose-style flow field prediction for robust mask reconstruction.
+
+- **CARA**: A classical computer vision approach consisting of HSV-based color filtering, watershed segmentation, and adaptive postprocessing. Provides robustness across varying imaging conditions.
+
+Both methods operate in parallel with outputs combined via a hybrid strategy to achieve optimal results.
+
+## Features
+
+- ✅ Automated colony detection and counting
+- ✅ Hybrid deep learning + classical CV pipeline
+- ✅ Robust across varying image conditions
+- ✅ Modular, extensible architecture
+- ✅ Parallel processing for improved accuracy
+- ✅ Server-based inference management
+
+## Documentation
+
+FHN-ColonyNet-Counting/
+├── app.py                          # Main application - executes all algorithms
+├── CARA.py                         # Classical computer vision (CARA) implementation
+├── CPSAM.py                        # Transformer-based segmentation algorithm
+├── Hybrid.py                       # Hybrid algorithm combining CPSAM + CARA outputs
+├── Documentation.md                # Complete documentation:
+│                                   #   - Algorithm methodology
+│                                   #   - Performance metrics & analysis
+│                                   #   - Usage instructions
+│                                   #   - Implementation details
+├── environment.yml                 # Conda Environment Setup
+├── README.md                       # Project overview
+├── input/                          # Input petri dish images
+└── output/                         # Generated counts & visualizations
+
+## Installation
+
+TODO

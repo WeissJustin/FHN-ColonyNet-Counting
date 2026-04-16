@@ -75,9 +75,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
-from medpy.filter.smoothing import anisotropic_diffusion
 from scipy import ndimage as ndi
-from skimage import exposure
 from skimage.color import rgb2hsv, rgb2gray
 from skimage.measure import label, regionprops, find_contours
 from skimage.morphology import (
@@ -156,14 +154,14 @@ hsv_v_start=0.635,
 hsv_v_step=0.05,
 hsv_v_min=0.35,
 hsv_s_min=0.00,
-hsv_err_tol=0.20,          # large colonies on dark agar have ~22% FP floor;
+hsv_err_tol=0.02,          # large colonies on dark agar have ~22% FP floor;
                             # tighter values can't converge and prevent detection
-h_ref_frac=0.12,
+h_ref_frac=0.10,
 hsv_extent_min=0.23,
 hsv_open_disk_small=3,
 hsv_open_disk_large=30,    # larger opening suppresses agar-texture noise better
 hsv_close_disk_large=15,   # larger closing bridges wider holes inside large CFUs
-min_object_area=100,       # raise floor to filter small agar-noise blobs
+min_object_area=90,       # raise floor to filter small agar-noise blobs
 small_area_quantile=0.75,
 small_cluster_extent_min=0.20,
 nonsmall_cluster_ecc_min=0.99,
@@ -295,125 +293,6 @@ def imextendedmin(gray_u8: np.ndarray, h: int) -> np.ndarray:
     return h_minima(gray_u8, h=h).astype(bool)
 
 
-def localcontrast_approx(
-    img: np.ndarray,
-    amount: float = 0.17,
-    mid: float = 0.9,
-    sigma: float = 3.0,
-) -> np.ndarray:
-    img01 = _as_float01(img)
-    if img01.ndim == 3:
-        gray = cv2.cvtColor(_to_uint8(img01), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-    else:
-        gray = img01
-    local_mean = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    d = gray - local_mean
-    weight = np.exp(-((gray - mid) ** 2) / (2 * 0.25 ** 2))
-    d_enhanced = d * (1.0 + amount * weight)
-    out_gray = np.clip(local_mean + d_enhanced, 0.0, 1.0)
-    if img01.ndim == 3:
-        denom = np.maximum(gray, 1e-6)
-        ratio = (out_gray / denom)[..., None]
-        out = np.clip(img01 * ratio, 0.0, 1.0)
-        return _to_uint8(out)
-    return _to_uint8(out_gray)
-
-
-def imlocalbrighten_approx(img: np.ndarray, strength: float = 0.5) -> np.ndarray:
-    img01 = _as_float01(img)
-    out = exposure.adjust_sigmoid(img01, cutoff=0.5, gain=5.0 * float(strength) + 1.0)
-    return _to_uint8(out)
-
-
-def gaussian_pyramid(img, levels):
-    G = [img]
-    for _ in range(levels):
-        img = cv2.pyrDown(img)
-        G.append(img)
-    return G
-
-
-def laplacian_pyramid(G):
-    L = []
-    for i in range(len(G) - 1):
-        up = cv2.pyrUp(G[i + 1], dstsize=(G[i].shape[1], G[i].shape[0]))
-        L.append(G[i] - up)
-    L.append(G[-1])
-    return L
-
-
-def reconstruct_pyramid(L):
-    current = L[-1]
-    for i in range(len(L) - 2, -1, -1):
-        current = cv2.pyrUp(current, dstsize=(L[i].shape[1], L[i].shape[0])) + L[i]
-    return current
-
-
-def phi(d, sigma, alpha):
-    abs_d = np.abs(d)
-    sign = np.sign(d)
-    w = np.exp(-(abs_d / sigma) ** 2)
-    return sign * (alpha * abs_d * w + abs_d * (1 - w))
-
-
-
-def locallapfilt_approx(img, sigma=0.2, alpha=3.0, beta=0.5, levels=5):
-    """
-    Approximation of MATLAB locallapfilt using pyramid + local remapping.
-
-    Parameters:
-        sigma: contrast threshold
-        alpha: detail enhancement
-        beta: base compression
-    """
-    img = _as_float01(img)
-
-    if img.ndim == 2:
-        img = img[..., None]
-
-    out_channels = []
-
-    for c in range(img.shape[2]):
-        I = img[..., c]
-
-        # --- 1. Gaussian pyramid ---
-        G = gaussian_pyramid(I, levels)
-
-        # --- 2. Laplacian pyramid ---
-        L = laplacian_pyramid(G)
-
-        # --- 3. Modify coefficients ---
-        L_mod = []
-
-        for k in range(len(L) - 1):
-            g0 = G[k]
-            d = I - cv2.resize(g0, (I.shape[1], I.shape[0]))
-
-            d_remap = phi(d, sigma, alpha)
-
-            I_remap = cv2.resize(g0, (I.shape[1], I.shape[0])) + d_remap
-
-            # recompute Gaussian + Laplacian locally
-            G_remap = gaussian_pyramid(I_remap, levels)
-            L_remap = laplacian_pyramid(G_remap)
-
-            L_mod.append(L_remap[k])
-
-        # top level (coarse tone)
-        L_mod.append(beta * L[-1])
-
-        # --- 4. Reconstruct ---
-        I_out = reconstruct_pyramid(L_mod)
-
-        out_channels.append(I_out)
-
-    out = np.stack(out_channels, axis=-1)
-
-    if out.shape[2] == 1:
-        out = out[..., 0]
-
-    return _to_uint8(np.clip(out, 0.0, 1.0))
-
 def imadjust_approx(
     img: np.ndarray,
     low_in=(0.2, 0.3, 0.0),
@@ -462,18 +341,6 @@ def imadjust_approx(
         return out.astype(orig_dtype)
     else:
         return np.clip(out * scale_back + 0.5, 0, scale_back).astype(orig_dtype)
-
-def imdiffusefilt_pm(img):
-    img01 = img.astype(float) / 255.0
-    out = anisotropic_diffusion(img01, niter=20, kappa=20, gamma=0.1)
-    return (out * 255).astype(np.uint8)
-
-
-def imsharpen_approx(img):
-    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
-    sharp = cv2.addWeighted(img, 1.5, blur, -0.5, 0)
-    return sharp
-
 
 def remove_background_rgb(
     img_rgb: np.ndarray,
@@ -735,63 +602,62 @@ def preprocess_expt(
     expt: np.ndarray,
     use_blackhat: bool = False,
     blackhat_disk_r: int = 15,
+    bg_sigma: float = 80.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Standard enhancement chain + optional blackhat.
+    Simplified preprocessing: background normalisation → per-channel contrast
+    stretch → CLAHE + bilateral filter for the gray reference.
 
     Parameters
     ----------
-    expt          : RGB uint8 image (cropped dish / half-dish)
-    use_blackhat  : if True, apply blackhat on the contrast-enhanced gray
-                    and add the result back before HSV masking
-    blackhat_disk_r: structuring element radius for the blackhat close op
+    expt            : RGB uint8 image (cropped dish / half-dish)
+    use_blackhat    : if True, add a blackhat pass to the gray reference so
+                      faint colony valleys are deepened before HSV calibration
+    blackhat_disk_r : structuring element radius for the blackhat close op
+    bg_sigma        : Gaussian sigma for remove_background_rgb.  80 px (default)
+                      is safe for colonies with radius ≤ 40 px.  Use 150 for
+                      large-CFU mode where colony radius can reach 60–120 px.
 
     Returns
     -------
-    expt_adj  : preprocessed RGB uint8 (used as input to HSV block)
-    gray_expt : grayscale uint8 of the preprocessed image
-                (optionally blackhat-boosted)
+    expt_adj  : preprocessed RGB uint8 — input to HSV masking (Block 2)
+    gray_expt : grayscale uint8 — input to imextendedmin reference + size guess
     """
-    # Cache lookup — preprocessing is params-independent and expensive
-    # (Perona-Malik 20 iters + Laplacian pyramid).  The tuner calls this
-    # hundreds of times per image with different TuningParams; caching the
-    # result gives a large speedup at zero cost to accuracy.
-    # id(expt) is O(1) — no image copy. Safe because _WORKER_RGB_CACHE in the
-    # tuner holds a live reference, so the same array object is reused for the
-    # same image across all param evaluations within a worker process.
-    _cache_key = (id(expt), expt.shape, expt.strides, use_blackhat, blackhat_disk_r)
+    _cache_key = (id(expt), expt.shape, expt.strides, use_blackhat, blackhat_disk_r, bg_sigma)
     _cached = _PREPROCESS_CACHE.get(_cache_key)
     if _cached is not None:
         return _cached
 
-    # --- background normalisation: makes all agar colors look the same ---
-    # Must run before imadjust_approx because imadjust uses fixed per-channel
-    # clip ranges calibrated for a specific agar brightness.  After this step
-    # the agar background is always near 140 DN, so imadjust sees consistent
-    # input regardless of whether the agar was yellow, pink, dark-red, or white.
-    expt = remove_background_rgb(expt)
+    # --- Step 1: background normalisation ---
+    # Divides each channel by a large-Gaussian background estimate so all agar
+    # colours (yellow, pink, dark-red, white) arrive at a uniform ~140 DN.
+    # This makes the fixed imadjust_approx clip ranges consistent across plates.
+    expt_bg = remove_background_rgb(expt, sigma=bg_sigma)
 
-    # --- standard chain (identical to _count_one_expt_full_logic) ---
-    expt_adj = imadjust_approx(expt)                           # stretch contrast per channel
-    expt_adj = locallapfilt_approx(expt_adj, sigma=0.2, alpha=0.5)  # edge-aware tone mapping
-    expt_adj = localcontrast_approx(expt_adj, amount=0.17, mid=0.9) # boost local microcontrast
-    expt_adj = imlocalbrighten_approx(expt_adj, strength=0.5)       # lift shadows
-    # im2grayContrast without imhmax: imhmax(h=100) was compressing the dynamic
-    # range from ~160 units down to ~68, losing faint colony signal. APP2 only
-    # uses gray for imextendedmin and the dish mask — full range is essential.
-    img01 = _as_float01(expt_adj)
-    expt_f = np.clip((1.0 - img01) - img01, 0.0, 1.0)  # clip(1 - 2*img, 0, 1)
-    expt_u8 = _to_uint8(expt_f)
-    expt_u8 = localcontrast_approx(expt_u8, 0.18, 0.9)
-    expt_u8 = imsharpen_approx(expt_u8)
-    gray_expt = _to_uint8(rgb2gray(_as_float01(255 - expt_u8)))
-    gray_expt = imdiffusefilt_pm(gray_expt)  # Perona-Malik smoothing (edges preserved)
+    # --- Step 2: per-channel contrast stretch ---
+    # Maps agar (~140 DN ≈ 0.55 float) to near-white and clips colony pixels
+    # to near-black.  After this step V_agar ≈ 0.87 and V_colony ≈ 0.0,
+    # giving the HSV adaptive loop the widest separation to calibrate against.
+    expt_adj = imadjust_approx(expt_bg)
 
-    # --- optional blackhat ---
+    # --- Step 3: gray reference for HSV calibration ---
+    # Convert the contrast-stretched image to grayscale, then apply:
+    #   CLAHE  — adaptive histogram equalisation normalises local dynamic range
+    #             so imextendedmin h values are consistent across plates with
+    #             different agar textures or sparse vs dense colony coverage.
+    #   Bilateral filter — edge-preserving smoothing flattens uniform agar
+    #             regions while keeping colony-to-agar boundaries sharp,
+    #             replacing Perona-Malik diffusion (20 iters) + Laplacian
+    #             pyramid + two localcontrast passes + imsharpen.
+    gray = cv2.cvtColor(expt_adj, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_clahe = clahe.apply(gray)
+    gray_expt = cv2.bilateralFilter(gray_clahe, d=9, sigmaColor=25, sigmaSpace=25)
+
+    # --- Optional blackhat ---
     if use_blackhat:
         se = _disk_kernel(blackhat_disk_r)
         blackhat = cv2.morphologyEx(gray_expt, cv2.MORPH_BLACKHAT, se)
-        # Add back: darker colonies become even darker (their V dip is amplified)
         gray_expt = cv2.add(gray_expt, blackhat)
 
     _result = (expt_adj, gray_expt)
@@ -1151,6 +1017,14 @@ def _expand_mask_to_dark_colony_halos(
     if not np.any(bw_clean):
         return bw_clean
 
+    # The old file (countCFUAPP22) had no halo expansion at all and performed
+    # better for large CFUs.  The original grow_r=48 over-inflates large colony
+    # masks, causing watershed to mis-split them or merge neighbours.
+    # Use a small, conservative grow_r (12px) so the expansion captures dark
+    # colony rims without running away into neighbouring colonies or agar shadow.
+    if large_cfu_mode:
+        grow_r_override = 16
+
     dish_mask = np.any(expt_rgb > 0, axis=2)
     if not np.any(dish_mask):
         return bw_clean
@@ -1180,7 +1054,7 @@ def _expand_mask_to_dark_colony_halos(
 
     coverage = float(np.count_nonzero(bw_clean)) / dish_area if dish_area > 0 else 0.0
     if large_cfu_mode:
-        grow_r = 48 if coverage <= 0.08 else 24
+        grow_r = grow_r_override  # conservative fixed radius set above
     elif coverage > 0.15:
         grow_r = 4
     elif coverage > 0.10:
@@ -1388,6 +1262,7 @@ def _count_colonies_with_instances(
     *,
     build_overlay: bool = True,
     build_rois: bool = True,
+    large_cfu_mode: bool = False,
 ) -> Tuple[int, np.ndarray, List[ROI], List[ROI], np.ndarray]:
     """
     Count colonies in a binary mask using per-blob watershed.
@@ -1395,6 +1270,10 @@ def _count_colonies_with_instances(
     Applies _conservative_watershed to every blob — h_maxima on the distance
     transform decides whether it is a single colony (1 seed) or a cluster
     (>1 seeds). No fragile eccentricity/extent pre-classification needed.
+
+    large_cfu_mode: when True, the ref_area refinement pass is disabled.
+    Large colonies at 1.8× ref_area are genuine single colonies, not clusters;
+    the refinement sub-split produces the overcounting seen on large-CFU plates.
     """
     bw = binary_image.astype(bool)
     bw = bwareaopen(bw, params.min_object_area)
@@ -1450,7 +1329,15 @@ def _count_colonies_with_instances(
     # watershed pass returns exactly 1 seed AND area <= 1.5× median blob area.
     # This gives a reliable single-colony size reference for the refinement pass.
     all_areas = np.array([r.area for r in regs], dtype=float)
-    if all_areas.size > 0:
+    if large_cfu_mode:
+        # Skip the refinement pre-scan entirely for large-CFU mode.
+        # The refinement pass fires on blobs > 1.8× ref_area and tries to
+        # sub-split them — on large-CFU plates those blobs are often genuine
+        # single large colonies, not clusters, so the sub-split overcounts.
+        # Conservative first-pass watershed (ws_thresh_abs_frac=0.05, σ=1.0)
+        # is sufficient; the second pass only makes things worse here.
+        ref_area: Optional[float] = None
+    elif all_areas.size > 0:
         overall_med = float(np.median(all_areas))
         # Cap at 50 candidates sorted by area — the smallest blobs are the most
         # reliable single-colony references and the median stabilises well before
@@ -1468,8 +1355,7 @@ def _count_colonies_with_instances(
                                        int(params.min_object_area))
             if n_pre == 1:
                 single_areas.append(reg_pre.area)
-        ref_area: Optional[float] = float(np.median(single_areas)) if single_areas else None
-
+        ref_area = float(np.median(single_areas)) if single_areas else None
     else:
         ref_area = None
 
@@ -1571,6 +1457,15 @@ def _count_one_expt_hsv(
         _cfu_class, _grad_max, _medium_check, _large_check = _gradient_hist_size_guess(gray_expt)
         if _cfu_class == "large":
             params = LARGE_CFU_PARAMS
+            # Re-preprocess with a larger background-estimation sigma so that large
+            # colony bodies (radius 60–120 px) do not contaminate their own
+            # background estimate.  sigma=80 is too close to the colony radius and
+            # reduces HSV contrast at the colony core, causing fragmented masks and
+            # watershed over-splitting.  sigma=150 keeps the normalisation benefit
+            # (equalises agar colour) without touching large-colony signal.
+            # This second preprocess call is a cache miss; it costs ~2 s but runs
+            # only once per large-CFU image and is cached for subsequent calls.
+            expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat, bg_sigma=150.0)
             print(f"  [expt {k}] size-adapt → large-CFU mode "
                   f"(gradient max {_grad_max:.1f}; large if max < {_large_check:.1f} "
                   f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
@@ -1594,7 +1489,9 @@ def _count_one_expt_hsv(
     # nearly the whole image and produces no useful border zone.
     # The original expt has clean hard zeros outside the circular crop.
     dish_mask_orig = np.any(expt > 0, axis=2)
-    border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=12)
+    _large_mode = params.hsv_err_tol > 0.05  # proxy for LARGE_CFU_PARAMS
+    _rim_iters = 5 if _large_mode else 12
+    border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
     n_border = int(np.count_nonzero(border_px))
     bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
 
@@ -1611,20 +1508,33 @@ def _count_one_expt_hsv(
     # cleanup" zone.  Keep only blobs in that zone that contain an
     # imextendedmin(h=15) seed not already near an accepted colony.
     # Add them back WITHOUT re-running morpho_cleanup (it already rejected them).
+    # Skipped for large-CFU mode (old file had no second pass; the shallow
+    # h=8 seeds recover too much agar-texture noise on sparse large-CFU plates).
     dish_area = int(np.count_nonzero(gray_expt != 0))
-    bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+    if not _large_mode:
+        bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
 
     # Expand accepted cores to the visible dark colony footprint BEFORE
     # watershed. This keeps the green fill, post mask, and yellow split
     # boundaries in the same geometry.
-    bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
+    # Large-CFU mode: skip halo expansion entirely.  Large colony halos are
+    # broad enough (~30–50 px) that even a small grow_r causes neighbouring
+    # halos to merge into one connected component; watershed then over-splits
+    # the merged mass.  APP22 had no halo expansion and performed better for
+    # large colonies — replicate that here.  Small/medium plates are unaffected.
+    if _large_mode:
+        bw_segment = bw_clean
+    else:
+        bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area,
+                                                        large_cfu_mode=False)
     bw_segment = _remove_edge_bar_artifacts(bw_segment)
 
     # --- BLOCKS 4+5+6: candidate filtering + watershed + count/ROI ---
     # Pass the ORIGINAL (non-preprocessed) image so the green overlay lands
     # on unaltered pixel colours, not the contrast-boosted version.
     num_cfu, out_image, colony_roi, cluster_roi, _ = _count_colonies_with_instances(
-        bw_segment, expt, params, build_overlay=True, build_rois=build_rois
+        bw_segment, expt, params, build_overlay=True, build_rois=build_rois,
+        large_cfu_mode=_large_mode,
     )
 
     # Hard ceiling (same as original)
@@ -1660,10 +1570,12 @@ def predict_count_only_hsv(
     params = params or TuningParams()
     expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
     total = 0
+    _large_mode = params.hsv_err_tol > 0.05  # proxy for LARGE_CFU_PARAMS; determined by caller
     for item in expts:
         expt = item["expt"]
 
-        expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat)
+        expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat,
+                                               bg_sigma=150.0 if _large_mode else 80.0)
 
         expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
         gray0 = _gray_uint8(expt_blur)
@@ -1688,15 +1600,22 @@ def predict_count_only_hsv(
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
         dish_mask_orig = np.any(expt > 0, axis=2)
-        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=12)
+        _rim_iters = 5 if _large_mode else 12
+        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
-        bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
-        bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area)
+        if not _large_mode:
+            bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+        if _large_mode:
+            bw_segment = bw_clean
+        else:
+            bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area,
+                                                            large_cfu_mode=False)
         bw_segment = _remove_edge_bar_artifacts(bw_segment)
 
         num_cfu, _, _, _, _ = _count_colonies_with_instances(
-            bw_segment, expt, params, build_overlay=False, build_rois=False
+            bw_segment, expt, params, build_overlay=False, build_rois=False,
+            large_cfu_mode=_large_mode,
         )
         total += int(num_cfu)
     return total
@@ -1748,6 +1667,9 @@ def predict_tuning_features(
         if _cfu_class == "large":
             params = _large_override or LARGE_CFU_PARAMS
             _large_cfu_mode = True
+            # Re-preprocess with larger background sigma (same rationale as in
+            # _count_one_expt_hsv — preserves large-colony HSV contrast).
+            expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat, bg_sigma=150.0)
             print(f"  [expt {k}] size-adapt → large-CFU mode "
                   f"(gradient max {_grad_max:.1f}; large if max < {_large_check:.1f} "
                   f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
@@ -1793,23 +1715,35 @@ def predict_tuning_features(
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
         # --- Rim filter ---
+        # Old file used 5 erosion iterations (~10px border zone); new default
+        # is 12 (~24px).  The wider zone trims or removes large colonies near
+        # the dish rim.  Restore the narrower zone for large-CFU mode only.
         dish_mask_orig = np.any(expt > 0, axis=2)
-        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=12)
+        _rim_iters = 5 if _large_cfu_mode else 12
+        border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
 
         # --- Second pass: recover blobs lost in morpho_cleanup on sparse plates ---
-        bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
-        bw_segment = _expand_mask_to_dark_colony_halos(
-            bw_clean, expt, gray_expt, dish_area,
-            large_cfu_mode=_large_cfu_mode,
-        )
+        # Old file had no second pass.  On sparse large-CFU plates (coverage <10%)
+        # imextendedmin(h=8) recovers too many shallow agar-texture fragments;
+        # skip for large-CFU mode to match old behaviour.
+        if not _large_cfu_mode:
+            bw_clean = _recover_second_pass_blobs(bw_raw, bw_clean, gray_expt, dish_area)
+        if _large_cfu_mode:
+            bw_segment = bw_clean
+        else:
+            bw_segment = _expand_mask_to_dark_colony_halos(
+                bw_clean, expt, gray_expt, dish_area,
+                large_cfu_mode=False,
+            )
         bw_segment = _remove_edge_bar_artifacts(bw_segment)
         _binary_parts.append(bw_segment)
 
         # --- BLOCKS 4+5+6: count + instance labels ---
         num_cfu, _, _, _, inst_labels = _count_colonies_with_instances(
-            bw_segment, expt, params, build_overlay=False, build_rois=False
+            bw_segment, expt, params, build_overlay=False, build_rois=False,
+            large_cfu_mode=_large_cfu_mode,
         )
 
         # Hard ceiling

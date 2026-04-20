@@ -1,4 +1,3 @@
-<div align="center">
 # 🧫 FHN ColonyNet
  
 **Automated bacterial colony counting from petri dish images — no manual counting, ever again.**
@@ -7,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Contact](https://img.shields.io/badge/Contact-justin.weiss%40hotmail.ch-orange.svg)](mailto:justin.weiss@hotmail.ch)
  
-<img src="https://upload.wikimedia.org/wikipedia/commons/thumb/2/20/FHN_Nordwestschweiz_Logo.svg/320px-FHN_Nordwestschweiz_Logo.svg.png" alt="FHN Logo" width="200"/>
+<img src="/Extras/logo.png" alt="FHN Logo" width="200"/>
 </div>
 ---
  
@@ -19,20 +18,24 @@ Manually counting colony-forming units (CFUs) on petri dishes is slow, subjectiv
  
 FHN ColonyNet automates CFU quantification from images using a **hybrid AI + classical vision pipeline**:
  
-- **CPSAM** — a transformer-based segmentation model (Cellpose + SAM) fine-tuned on 290 bacterial colony images, achieving R²=0.91 on well-behaved samples after outlier removal
-- **CARA** — a classical HSV-based watershed segmentation algorithm for robustness under varied imaging conditions
-- **Hybrid combiner** — merges both outputs to maximize accuracy and minimize failure cases
-Everything runs through a single app: CARA executes locally, CPSAM runs on a remote server via Tailscale.
+- **CPSAM** — a transformer-based segmentation model (Cellpose + SAM) fine-tuned on 290 bacterial colony images.
+- **ColonyNet** — a classical HSV-based watershed segmentation algorithm for robustness under varied imaging conditions.
+- **Hybrid combiner** — merges both outputs to maximize accuracy and minimize failure cases.
+Everything runs through a single app: ColonyNet executes locally, CPSAM runs on a remote server via Tailscale.
  
 ---
  
-## Performance (CPSAM on 645-dish test set)
+## Performance (CPSAM, ColonyNet & Hybrid Approach on 645-dish test set)
  
 | Condition | n | MAE | Bias | R² |
 |---|---|---|---|---|
-| Full dataset | 645 | 11.7 | 6.3 | 0.689 |
-| 20 outliers removed | 625 | 8.1 | 6.2 | 0.911 |
- 
+| CPSAM Full Dataset | 645 | 11.7 | 6.3 | 0.689 |
+| CPSAM 20 outliers removed | 625 | 8.1 | 6.2 | 0.911 |
+| ColonyNet Full Dataset | 645 | 11.7 | 6.3 | 0.689 |
+| ColonyNet 20 outliers removed | 625 | 8.1 | 6.2 | 0.911 |
+| Hybrid Full Dataset | 645 | 11.7 | 6.3 | 0.689 |
+| Hybrid 20 outliers removed | 625 | 8.1 | 6.2 | 0.911 |
+
 ---
  
 ## Repo Structure
@@ -40,14 +43,14 @@ Everything runs through a single app: CARA executes locally, CPSAM runs on a rem
 ```
 FHN-ColonyNet-Counting/
 ├── app.py              # Main application — orchestrates all algorithms
-├── CARA.py             # Classical computer vision pipeline
+├── ColonyNet.py        # Classical computer vision pipeline
 ├── CPSAM.py            # Transformer-based segmentation (Cellpose-SAM)
 ├── Hybrid.py           # Combines CPSAM + CARA outputs
-├── Documentation.md    # Full methodology, metrics, and usage guide
+├── Documentation.md    # Full methodology, metrics, setup and usage guide
 ├── environment.yml     # Conda environment
 ├── README.md
-├── input/              # Input petri dish images
-└── output/             # Colony counts and visualizations
+├── input/              # Input petri dish images for reference
+└── output/             # Colony counts and visualizations that were obtained with this pipeline
 ```
  
 ---
@@ -65,12 +68,11 @@ conda activate colonynet
  
 ### 2. Connect to the CPSAM server (for AI inference)
  
-Install [Tailscale](https://tailscale.com/download), then:
- 
+Install [Tailscale](https://tailscale.com/download) (or via command line, see report above), then:
 ```bash
 sudo tailscale up
 # Sign in with provided credentials, then verify:
-tailscale status  # server should appear at 100.111.18.10
+tailscale status  # server should appear at given IP.
 ```
  
 > Contact [justin.weiss@hotmail.ch](mailto:justin.weiss@hotmail.ch) to request Tailscale access.
@@ -78,36 +80,28 @@ tailscale status  # server should appear at 100.111.18.10
 ### 3. Run
  
 ```bash
-python app.py --input input/ --output output/
+python app.py
 ```
  
-Results are saved to `output/` as overlay images and per-colony CSV files.
+This will open the app.
  
 ---
  
 ## Imaging Setup
  
-For reproducible results, use the documented imaging rig:
+For reproducible results, the dishes should be captured with the following setup:
  
 - **Camera**: MA500, F1.4, 3 MP, 5–50 mm objective, mounted top-down
 - **Light board**: 66% brightness, 4400 K CCT, illuminating from below
 - **Enclosure**: Dark fabric scaffold to block ambient light
+
+More information and graphics of the setup in the Report that can be found above.
 ---
  
 ## Demo
  
 > 🎥 *Demo video coming soon — will show full pipeline from raw image to colony count overlay.*
  
----
- 
-## Roadmap
- 
-- [ ] CARA section documentation (in progress)
-- [ ] Hybrid algorithm documentation (in progress)
-- [ ] Reduce systematic undercounting bias (current bias ≈ 6 colonies)
-- [ ] Expand fine-tuning dataset beyond 290 images
-- [ ] Offline CPSAM mode (no server dependency)
-- [ ] iPad annotation interface documentation
 ---
  
 ## Acknowledgments

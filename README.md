@@ -6,8 +6,10 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Contact](https://img.shields.io/badge/Contact-justin.weiss%40hotmail.ch-orange.svg)](mailto:justin.weiss@hotmail.ch)
  
-<img src="/Extras/Logo.png" alt="FHN Logo" width="200"/>
-</div>
+<p align="center">
+  <img src="/Extras/Logo.png" alt="FHN Logo" width="200"/>
+</p>
+
 ---
  
 ## Problem

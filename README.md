@@ -7,7 +7,7 @@
 [![Contact](https://img.shields.io/badge/Contact-justin.weiss%40hotmail.ch-orange.svg)](mailto:justin.weiss@hotmail.ch)
  
 <p align="center">
-  <img src="/Extras/Logo.png" alt="FHN Logo" width="200"/>
+  <img src="/Extras/Logo.png" alt="FHN Logo" width="400"/>
 </p>
 
 ---
@@ -62,7 +62,7 @@ FHN-ColonyNet-Counting/
 ### 1. Clone & install
  
 ```bash
-git clone https://github.com/FHN/ColonyNet.git
+git clone https://github.com/WeissJustin/FHN-ColonyNet-Counting.git
 cd ColonyNet
 conda env create -f environment.yml
 conda activate colonynet

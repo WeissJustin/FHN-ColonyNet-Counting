@@ -123,12 +123,19 @@ class TuningParams:
     ws_gauss_sigma: float = 0.3
     uncountable_cutoff: int = 300
     uncountable_precheck_cutoff: int = 400
+    large_cfu_mode: bool = False
 
 
 CLASS_LARGE_THRESH = 0.0043
 CLASS_MEDIUM_THRESH = 0.0032
 CLASS_HIGH_GRAD_LARGE_MULT = 15.0
-CLASS_HIGH_GRAD_LARGE_ABS_MIN = 170_000.0
+CLASS_HIGH_GRAD_LARGE_ABS_MIN = 75_000.0
+
+# Blob-size classifier thresholds (median Otsu-blob area in raw image, px²).
+# Large colony radius ~60-130 px → area ~11 000–53 000 px².
+# Small colony radius ~8-25 px → area ~200–2 000 px².
+LARGE_BLOB_AREA_THRESH  = 4_000.0   # median area above this → large-CFU mode
+MEDIUM_BLOB_AREA_THRESH = 1_000.0   # median area above this → medium (uses small params)
 
 
 # ---------------------------------------------------------------------------
@@ -161,18 +168,20 @@ hsv_err_tol=0.02,          # large colonies on dark agar have ~22% FP floor;
 h_ref_frac=0.10,
 hsv_extent_min=0.23,
 hsv_open_disk_small=3,
-hsv_open_disk_large=30,    # larger opening suppresses agar-texture noise better
-hsv_close_disk_large=15,   # larger closing bridges wider holes inside large CFUs
-min_object_area=90,       # raise floor to filter small agar-noise blobs
+hsv_open_disk_large=18,    # reduced from 30: less erosion of thin colony-rim arcs
+hsv_close_disk_large=25,   # increased from 15: better gap-bridging for large colony rims
+min_object_area=150,       # raised from 90: suppresses tiny agar specks while
+                            # keeping thin arc fragments (~10px × 15px = 150px²)
 small_area_quantile=0.75,
 small_cluster_extent_min=0.20,
 nonsmall_cluster_ecc_min=0.99,
 nonsmall_cluster_extent_min=0.20,
 colony_circularity_min=0.09,
-ws_thresh_abs_frac=0.05,
-ws_gauss_sigma=1.0,
+ws_thresh_abs_frac=0.12,   # raised from 0.05: require 12% of dmax saddle depth to split
+ws_gauss_sigma=2.0,        # raised from 1.0: smoother DT reduces spurious peaks per colony
 uncountable_cutoff=300,
 uncountable_precheck_cutoff=400,
+large_cfu_mode=True,       # activates large-CFU code paths (skip expansion, refinement)
 )
 
 
@@ -915,7 +924,12 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
             continue
         label_i = i + 1
         area = int(blob_areas[label_i])
-        r = 12 if area < 1500 else (6 if area < 8000 else int(params.hsv_close_disk_large))
+        if params.large_cfu_mode:
+            # In large-CFU mode all blobs need generous closing to bridge wide
+            # rim gaps; don't gate on area since even small arc fragments need it.
+            r = int(params.hsv_close_disk_large)
+        else:
+            r = 12 if area < 1500 else (6 if area < 8000 else int(params.hsv_close_disk_large))
         # Pad the bounding box by r so dilation/erosion have enough room.
         # Operating on the padded crop instead of the full image reduces cost
         # from O(H×W) to O((blob_bbox + 2r)²) — ~100–1000× faster per blob.
@@ -1300,97 +1314,90 @@ def _remove_edge_bar_artifacts(bw: np.ndarray) -> np.ndarray:
     return out
 
 
-def _has_dark_object_probe(expt: np.ndarray, params: TuningParams) -> bool:
-    gray = _gray_uint8(cv2.GaussianBlur(expt, (0, 0), 2))
-    if not np.any(gray != 0):
-        return False
-    thr, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    probe = (gray < thr) & (gray != 0)
-    probe = bwareaopen(probe, max(25, int(params.min_object_area)))
-    probe = bwpropfilt(probe, "Extent", (0.15, 1.0))
-    probe = _remove_edge_bar_artifacts(probe)
-    return bool(np.any(probe))
 
 
-def _identify_border_pixels(window_u8: np.ndarray) -> int:
-    w = np.asarray(window_u8).ravel()
-    if w.size == 0:
-        return 0
-    ctr = w[w.size // 2]
-    if ctr == 0 or ctr >= 250:
-        return 0
-    return int(np.count_nonzero(w >= 250) > 1)
+_EDGE_MAX_LARGE_THRESH  = 1100   # largest Canny edge fragment (px) in large-CFU plates
+_N_LOCAL_BLOB_MAX_LARGE = 150    # plates with ≥150 σ=30 local blobs are small-CFU
+_OTSU_N_MIN_LARGE       = 2      # need ≥2 Otsu blobs OR n_local ≥50 (catches 1182E)
+_GRAY_STD_FALLBACK      = 40.0   # fallback: high std + moderate n_local → large (catches 1186N)
+# cond3 thresholds: catches low-contrast large-CFU plates (e.g. DIFIP2 at dilu2)
+# where edge_max is always ~750 regardless of CFU size, but n_local and gray_std
+# are elevated compared to nearly-empty small-CFU plates at the same dilution.
+_COND3_NLOC_LO  = 20    # moderate local blob count (more than empty plate)
+_COND3_NLOC_HI  = 80    # below this → not an overcrowded/uncountable plate
+_COND3_STD_MIN  = 25.0  # sufficient gray variance to confirm colony signal
 
 
-def _identify_high_bdry_pixels(window_u8: np.ndarray) -> int:
-    w = np.asarray(window_u8).ravel()
-    if w.size == 0:
-        return 0
-    ctr = w[w.size // 2]
-    if ctr == 0:
-        return 0
-    return int(np.count_nonzero(w) > 2)
-
-
-def _gradient_hist_size_guess(gray_expt: np.ndarray) -> Tuple[str, float, float, float]:
+def _blob_size_class_guess(expt_raw: np.ndarray) -> Tuple[str, float, float, float]:
     """
-    First size guess from APP1's blur + Laplacian histogram signal.
+    Classify colony size using four features on the raw (RGB) image.
 
-    Returns (class, max_hist_bin_count, medium_threshold, large_threshold).
+    Primary rule (cond1): large-CFU plates have long continuous Canny edge fragments
+      (edge_max ≥ 1100), not too many local-dark blobs (n_local < 150), and at least
+      some dark Otsu blobs visible (otsu_n ≥ 2) or many σ=30 local blobs (n_local ≥ 50).
+
+    Fallback rule (cond2): plates with extremely high gray variance (std ≥ 40) and a
+      moderate blob count are large-CFU even when edge fragments are short (e.g. 1186N
+      where many overlapping large colonies reduce edge fragment length).
+
+    Low-contrast rule (cond3): catches large-CFU plates on camera setups that produce
+      low-contrast images (edge_max always ~750) — e.g. DIFIP2 at dilu2.  A moderate
+      n_local [20, 80) together with sufficient gray variance (≥25) indicates that real
+      large colonies are present, distinguishing them from nearly-empty plates (n_local<20,
+      low std) and overcrowded plates (n_local≥80, also excluded by this range).
+
+    LARGE if cond1 OR cond2 OR cond3.
+    Returns (class, edge_max, n_local, gray_std).
     """
-    if gray_expt is None or gray_expt.size == 0:
-        return "small", 0.0, 0.0, 0.0
+    img = expt_raw
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img.copy()
+    if gray.dtype != np.uint8:
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    gray_expt = _gray_uint8(gray_expt)
-    blur = cv2.GaussianBlur(
-        gray_expt, (3, 3),
-        sigmaX=0.5, sigmaY=0.5,
-        borderType=cv2.BORDER_REPLICATE,
+    H, W = gray.shape
+    bh, bw = int(H * 0.05), int(W * 0.05)
+
+    def _rm(m: np.ndarray) -> np.ndarray:
+        m2 = m.copy()
+        m2[:bh, :] = 0; m2[-bh:, :] = 0
+        m2[:, :bw] = 0; m2[:, -bw:] = 0
+        return m2
+
+    # Feature 1: largest Canny edge fragment
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 15, 50)
+    edges = _rm(edges)
+    n_e, _, stats_e, _ = cv2.connectedComponentsWithStats(edges // 255, connectivity=8)
+    edge_max = int(max((stats_e[i, cv2.CC_STAT_AREA] for i in range(1, n_e)), default=0))
+
+    # Feature 2: count of locally-dark blobs (σ=30 background subtraction, depth 12)
+    gf = gray.astype(np.float32)
+    blur30 = cv2.GaussianBlur(gf, (0, 0), 30)
+    dark30 = _rm(((gf - blur30) < -12).astype(np.uint8))
+    n_lc, _, stats_lc, _ = cv2.connectedComponentsWithStats(dark30, connectivity=8)
+    n_local = int(sum(1 for i in range(1, n_lc) if stats_lc[i, cv2.CC_STAT_AREA] >= 100))
+
+    # Feature 3: number of Otsu-threshold blobs ≥ 200 px²
+    thr, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark_o = _rm((gray < thr).astype(np.uint8))
+    n_o, _, stats_o, _ = cv2.connectedComponentsWithStats(dark_o, connectivity=8)
+    otsu_n = int(sum(1 for i in range(1, n_o) if stats_o[i, cv2.CC_STAT_AREA] >= 200))
+
+    # Feature 4: gray std-dev inside the dish (nonzero pixels)
+    nz = gray > 0
+    gray_std = float(np.std(gray[nz])) if np.any(nz) else 0.0
+
+    cond1 = (
+        edge_max >= _EDGE_MAX_LARGE_THRESH
+        and n_local < _N_LOCAL_BLOB_MAX_LARGE
+        and (otsu_n >= _OTSU_N_MIN_LARGE or n_local >= 50)
     )
-    im_grad = np.abs(cv2.Laplacian(
-        blur, cv2.CV_32F, ksize=3,
-        borderType=cv2.BORDER_REPLICATE,
-    ))
-
-    border_grad = (im_grad >= 250).astype(np.uint8)
-    border_grad2 = ndi.generic_filter(
-        border_grad,
-        function=_identify_high_bdry_pixels,
-        size=(3, 3),
-        mode="nearest",
-    )
-    im_grad_final = im_grad.astype(np.float32) * (1.0 - border_grad2.astype(np.float32))
-
-    border_med = ndi.generic_filter(
-        im_grad,
-        function=_identify_border_pixels,
-        size=(3, 3),
-        mode="nearest",
-    )
-    im_grad_final = im_grad_final * (1.0 - border_med.astype(np.float32))
-
-    vals = np.sort(im_grad_final.reshape(-1))
-    vals = vals[vals > 5]
-    if vals.size == 0:
-        vals = np.array([6.0], dtype=np.float32)
-
-    bins = np.arange(float(vals.min()), float(vals.max()) + 5.0, 5.0)
-    hist, _ = np.histogram(vals, bins=bins)
-
-    sz_total = float(gray_expt.shape[0] * gray_expt.shape[1])
-    large_check = sz_total * CLASS_LARGE_THRESH
-    medium_check = sz_total * CLASS_MEDIUM_THRESH
-    max_val = float(hist.max()) if hist.size else 0.0
-    high_grad_large_check = max(
-        large_check * CLASS_HIGH_GRAD_LARGE_MULT,
-        CLASS_HIGH_GRAD_LARGE_ABS_MIN,
-    )
-
-    if max_val < large_check or max_val >= high_grad_large_check:
-        return "large", max_val, medium_check, large_check
-    if medium_check < max_val < large_check:
-        return "medium", max_val, medium_check, large_check
-    return "small", max_val, medium_check, large_check
+    cond2 = (n_local >= 40 and n_local < _N_LOCAL_BLOB_MAX_LARGE and gray_std >= _GRAY_STD_FALLBACK)
+    cond3 = (n_local >= _COND3_NLOC_LO and n_local < _COND3_NLOC_HI and gray_std >= _COND3_STD_MIN)
+    is_large = cond1 or cond2 or cond3
+    return ("large" if is_large else "small"), float(edge_max), float(n_local), float(gray_std)
 
 
 def _count_colonies_with_instances(
@@ -1569,14 +1576,6 @@ def _count_one_expt_hsv(
     # --- BLOCK 1: preprocess ---
     expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat)
 
-    # --- Zero CFU fast-check (from original) ---
-    expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
-    gray0 = _gray_uint8(expt_blur)
-    bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
-    bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
-    if not np.any(bw_min0) and not _has_dark_object_probe(expt, params):
-        return 0, "Zero", "Zero", 0.0, expt, [], [], np.zeros((*expt.shape[:2], 3), dtype=np.uint8)
-
     # --- Uncountable fast-check (Otsu on raw gray, same as original) ---
     gray_unc = _gray_uint8(expt)
     thr, _ = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -1590,28 +1589,16 @@ def _count_one_expt_hsv(
         return int(num_unc), "Uncountable", "Uncountable", _mean_region_area(bw_unc), unc_overlay, [], [], bw_unc_rgb
 
     # --- Auto size-adapt: switch to large-CFU params if needed ---
-    # Use APP1's blur + Laplacian gradient histogram as the first size guess.
     if _auto_adapt:
-        _cfu_class, _grad_max, _medium_check, _large_check = _gradient_hist_size_guess(gray_expt)
+        _cfu_class, _edge_max, _n_loc, _gray_std = _blob_size_class_guess(expt)
         if _cfu_class == "large":
             params = LARGE_CFU_PARAMS
-            # Re-preprocess with a larger background-estimation sigma so that large
-            # colony bodies (radius 60–120 px) do not contaminate their own
-            # background estimate.  sigma=80 is too close to the colony radius and
-            # reduces HSV contrast at the colony core, causing fragmented masks and
-            # watershed over-splitting.  sigma=150 keeps the normalisation benefit
-            # (equalises agar colour) without touching large-colony signal.
-            # This second preprocess call is a cache miss; it costs ~2 s but runs
-            # only once per large-CFU image and is cached for subsequent calls.
             expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat, bg_sigma=150.0)
             print(f"  [expt {k}] size-adapt → large-CFU mode "
-                  f"(gradient max {_grad_max:.1f}; large if max < {_large_check:.1f} "
-                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
+                  f"(edge_max={_edge_max:.0f} n_local={_n_loc:.0f} gray_std={_gray_std:.1f})")
         else:
-            print(f"  [expt {k}] size-adapt → {_cfu_class}-CFU mode "
-                  f"(gradient max {_grad_max:.1f}; medium if max > {_medium_check:.1f}, "
-                  f"large if max < {_large_check:.1f} "
-                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
+            print(f"  [expt {k}] size-adapt → small-CFU mode "
+                  f"(edge_max={_edge_max:.0f} n_local={_n_loc:.0f} gray_std={_gray_std:.1f})")
 
     # --- BLOCK 2: adaptive HSV mask ---
     bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
@@ -1627,7 +1614,7 @@ def _count_one_expt_hsv(
     # nearly the whole image and produces no useful border zone.
     # The original expt has clean hard zeros outside the circular crop.
     dish_mask_orig = np.any(expt > 0, axis=2)
-    _large_mode = params.hsv_err_tol > 0.05  # proxy for LARGE_CFU_PARAMS
+    _large_mode = params.large_cfu_mode
     _rim_iters = 5 if _large_mode else 12
     border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
     n_border = int(np.count_nonzero(border_px))
@@ -1708,19 +1695,12 @@ def predict_count_only_hsv(
     params = params or TuningParams()
     expts = _get_expts_from_detectdish(rgb, dish_mode=dish_mode, target_area_px2=float(target_area_px2))
     total = 0
-    _large_mode = params.hsv_err_tol > 0.05  # proxy for LARGE_CFU_PARAMS; determined by caller
+    _large_mode = params.large_cfu_mode
     for item in expts:
         expt = item["expt"]
 
         expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat,
                                                bg_sigma=150.0 if _large_mode else 80.0)
-
-        expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
-        gray0 = _gray_uint8(expt_blur)
-        bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
-        bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
-        if not np.any(bw_min0) and not _has_dark_object_probe(expt, params):
-            continue
 
         gray_unc = _gray_uint8(expt)
         thr, _ = cv2.threshold(gray_unc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -1801,32 +1781,17 @@ def predict_tuning_features(
         expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat)
 
         # --- Size-adapt: keep small params fixed, override only large mode ---
-        _cfu_class, _grad_max, _medium_check, _large_check = _gradient_hist_size_guess(gray_expt)
+        _cfu_class, _edge_max, _n_loc, _gray_std = _blob_size_class_guess(expt)
         if _cfu_class == "large":
             params = _large_override or LARGE_CFU_PARAMS
             _large_cfu_mode = True
-            # Re-preprocess with larger background sigma (same rationale as in
-            # _count_one_expt_hsv — preserves large-colony HSV contrast).
             expt_adj, gray_expt = preprocess_expt(expt, use_blackhat=use_blackhat, bg_sigma=150.0)
             print(f"  [expt {k}] size-adapt → large-CFU mode "
-                  f"(gradient max {_grad_max:.1f}; large if max < {_large_check:.1f} "
-                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
+                  f"(edge_max={_edge_max:.0f} n_local={_n_loc:.0f} gray_std={_gray_std:.1f})")
         else:
             params = _small_params
-            print(f"  [expt {k}] size-adapt → {_cfu_class}-CFU mode "
-                  f"(gradient max {_grad_max:.1f}; medium if max > {_medium_check:.1f}, "
-                  f"large if max < {_large_check:.1f} "
-                  f"or max >= {max(_large_check * CLASS_HIGH_GRAD_LARGE_MULT, CLASS_HIGH_GRAD_LARGE_ABS_MIN):.1f})")
-
-        # --- Zero-CFU fast-check ---
-        expt_blur = cv2.GaussianBlur(expt, (0, 0), 4)
-        gray0 = _gray_uint8(expt_blur)
-        bw_min0 = imextendedmin(gray0, 60) & (gray0 != 0)
-        bw_min0 = bwpropfilt(bw_min0, "Extent", (0.2, 1.0))
-        if not np.any(bw_min0) and not _has_dark_object_probe(expt, params):
-            methods.append("Zero")
-            classes.append("Zero")
-            continue
+            print(f"  [expt {k}] size-adapt → small-CFU mode "
+                  f"(edge_max={_edge_max:.0f} n_local={_n_loc:.0f} gray_std={_gray_std:.1f})")
 
         # --- Uncountable fast-check (Otsu on raw gray) ---
         gray_unc = _gray_uint8(expt)

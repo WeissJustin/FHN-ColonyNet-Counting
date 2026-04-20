@@ -958,6 +958,10 @@ def main():
 
     matched = build_matched_table(gt_dish, cpsam_dish, algo1_dish, algo2_dish)
     matched = matched.sort_values("petri_dish").reset_index(drop=True)
+    excluded = matched[matched["gt"] > 300]
+    if not excluded.empty:
+        print(f"[Filter] Excluding {len(excluded)} dish(es) with GT > 300: {excluded['petri_dish'].tolist()}")
+    matched = matched[matched["gt"] <= 300].reset_index(drop=True)
     matched.to_csv(out_dir / "matched_rows.csv", index=False)
 
     labels = {"cpsam": "CPSAM", "algo1": "KC Algorithm", "algo2": "FHN ColonyNet"}

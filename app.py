@@ -45,8 +45,13 @@ import numpy as np
 import cv2
 from dataclasses import dataclass, field
 import copy
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QRect, QRectF, QPoint, QTimer, QModelIndex, QSettings
-from PySide6.QtGui import QPixmap, QImage, QFont, QPalette, QColor, QCursor, QPen, QIcon, QPainterPath
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QRect, QRectF, QPoint, QSize, QTimer, QModelIndex, QSettings, QByteArray
+from PySide6.QtGui import QPixmap, QImage, QFont, QPalette, QColor, QCursor, QPen, QIcon, QPainterPath, QPainter
+try:
+    from PySide6.QtSvg import QSvgRenderer as _QSvgRenderer
+    _HAS_SVG = True
+except ImportError:
+    _HAS_SVG = False
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QHBoxLayout, QVBoxLayout, QGridLayout, QLabel, QPushButton,
@@ -57,6 +62,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QSlider
 from countCFUAPP2 import count_cfu_app2
 from PySide6.QtWidgets import QCheckBox
+import redesign_patch
+redesign_patch.install()
 
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 VERSION_FOLDER = ""  # keep as in your code
@@ -73,37 +80,91 @@ GPU_CPSAM_SCRIPT   = "CPSAM.py"
 GPU_CPSAM_MODEL    = "/home/justin/Documents/pretrained/cpsam_finetuned.zip"
 # ─────────────────────────────────────────────────────────────────────────────
 
-LIGHT_COMBO_ARROW_PATH = (Path(__file__).resolve().parent / "ui_assets" / "combo_arrow_dark.svg").as_posix()
 SHARED_SLIDER_QSS = """
 QSlider {
     min-height: 18px;
 }
 QSlider::groove:horizontal {
     border: none;
-    height: 6px;
-    background: #1f2937;
-    border-radius: 3px;
+    height: 4px;
+    background: #1d2029;
+    border-radius: 2px;
 }
 QSlider::sub-page:horizontal {
-    background: #4b5563;
-    border-radius: 3px;
+    background: #4781d1;
+    border-radius: 2px;
 }
 QSlider::add-page:horizontal {
-    background: #1f2937;
-    border-radius: 3px;
+    background: #1d2029;
+    border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    background: #f3f4f6;
-    border: 1px solid #9ca3af;
-    width: 16px;
+    background: #f2f5fb;
+    border: 1px solid rgba(0,0,0,100);
+    width: 14px;
+    height: 14px;
     margin: -5px 0;
-    border-radius: 8px;
+    border-radius: 7px;
+}
+QSlider::handle:horizontal:hover {
+    border: 2px solid rgba(138,180,255,90);
+}
+"""
+
+# Subtle badge-style QPushButton for use inside the title bar.
+# Overrides the global QSS which would apply 12px radius + gradient.
+_TITLEBAR_BTN_QSS = """
+QPushButton {
+    background: rgba(255,255,255,5);
+    border: 1px solid rgba(255,255,255,20);
+    border-radius: 7px;
+    padding: 3px 10px;
+    color: #9aa1ae;
+    font-size: 12px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background: rgba(255,255,255,10);
+    border: 1px solid rgba(255,255,255,38);
+    color: #e7eaf0;
+}
+QPushButton:pressed {
+    background: rgba(0,0,0,20);
+    border: 1px solid rgba(255,255,255,15);
+    color: #9aa1ae;
 }
 """
 
 
 class ColorComboBox(QComboBox):
+    # Swatch colors keyed to item text
+    _SWATCH = {
+        "Blue":  "#4d9ef6",
+        "Pink":  "#f06db0",
+        "Red":   "#f06060",
+        "Green": "#4ade80",
+        "Black": "#666666",
+    }
+
+    def _make_swatch_icon(self, hex_color: str, size: int = 12) -> QIcon:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(QColor(hex_color))
+        p.setPen(QColor(255, 255, 255, 40))
+        p.drawEllipse(1, 1, size - 2, size - 2)
+        p.end()
+        return QIcon(pm)
+
     def showPopup(self):
+        # Attach swatch icons to items on first show
+        model = self.model()
+        if model is not None:
+            for i in range(model.rowCount()):
+                txt = self.itemText(i)
+                if txt in self._SWATCH and self.itemIcon(i).isNull():
+                    self.setItemIcon(i, self._make_swatch_icon(self._SWATCH[txt]))
         super().showPopup()
         QTimer.singleShot(0, self._polish_popup)
 
@@ -115,491 +176,229 @@ class ColorComboBox(QComboBox):
         if selection_model is not None:
             selection_model.clearSelection()
         view.setCurrentIndex(QModelIndex())
-        view.setContentsMargins(0, 0, 0, 0)
-        view.viewport().setContentsMargins(0, 0, 0, 0)
         view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        view.setContentsMargins(4, 4, 4, 4)
         popup = view.window()
-        base = view.palette().color(QPalette.Base)
-        popup_pal = popup.palette()
-        popup_pal.setColor(QPalette.Window, base)
-        popup_pal.setColor(QPalette.Base, base)
-        popup.setPalette(popup_pal)
-        popup.setAutoFillBackground(True)
         popup.setContentsMargins(0, 0, 0, 0)
-        popup.setStyleSheet(f"background: {base.name()}; border: none;")
+        # Design-palette dark styling
+        BG = "#0d0f14"
+        popup.setStyleSheet(
+            f"background: {BG};"
+            "border: 1px solid rgba(255,255,255,18);"
+            "border-radius: 10px;"
+        )
+        view.setStyleSheet(
+            f"""
+            QListView, QListView::viewport {{
+                background: {BG};
+                border: none;
+                outline: 0;
+                padding: 4px;
+            }}
+            QListView::item {{
+                color: #e7eaf0;
+                font-family: "Geist", "Inter", "SF Pro Text", sans-serif;
+                font-size: 13px;
+                padding: 6px 10px;
+                border-radius: 6px;
+                min-height: 20px;
+            }}
+            QListView::item:hover {{
+                background: rgba(255,255,255,6);
+            }}
+            QListView::item:selected {{
+                background: rgba(138,180,255,18);
+                color: #e7eaf0;
+            }}
+            """
+        )
+        pal = view.palette()
+        pal.setColor(QPalette.Base,            QColor(BG))
+        pal.setColor(QPalette.Window,          QColor(BG))
+        pal.setColor(QPalette.Text,            QColor("#e7eaf0"))
+        pal.setColor(QPalette.Highlight,       QColor(138, 180, 255, 40))
+        pal.setColor(QPalette.HighlightedText, QColor("#e7eaf0"))
+        view.setPalette(pal)
         row_count = view.model().rowCount() if view.model() is not None else 0
         if row_count > 0:
             row_h = max(view.sizeHintForRow(i) for i in range(row_count))
-            total_h = row_h * row_count + 2
+            total_h = row_h * row_count + 10
             popup.resize(popup.width(), total_h)
         view.viewport().update()
 
+
+def _make_svg_icon(svg_body: str, size: int = 16, color: str = "#e7eaf0") -> QIcon:
+    """Render a 24×24-viewBox SVG path snippet to a QIcon — renders at 2× for crispness."""
+    if not _HAS_SVG:
+        return QIcon()
+    render_size = size * 2  # render at 2× then let Qt scale
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{render_size}" height="{render_size}" '
+        f'viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.5" '
+        f'stroke-linecap="round" stroke-linejoin="round">{svg_body}</svg>'
+    )
+    pm = QPixmap(render_size, render_size)
+    pm.fill(Qt.transparent)
+    renderer = _QSvgRenderer(QByteArray(svg.encode()))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    renderer.render(p)
+    p.end()
+    # Scale down to target size with smooth filter
+    pm = pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return QIcon(pm)
+
+
+# SVG paths for tool buttons (viewBox 0 0 24 24)
+_ICON_PAINT  = '<path d="M4 20l4-1 10-10-3-3L5 16l-1 4zM13 7l4 4"/>'
+_ICON_SELECT = '<path d="M4 4l6 16 2-7 7-2L4 4z"/>'
+_ICON_REMOVE = '<path d="M6 6l12 12M18 6L6 18"/>'
+
+
+class KbdBadgeButton(QPushButton):
+    """QPushButton that paints a small keyboard-shortcut badge in its right margin."""
+
+    def __init__(self, text: str = "", kbd: str = "", parent=None):
+        super().__init__(text, parent)
+        self._kbd = kbd
+
+    def setKbd(self, kbd: str):
+        self._kbd = kbd
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._kbd:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        small_font = QFont(p.font())
+        small_font.setPointSizeF(9.5)
+        small_font.setBold(False)
+        p.setFont(small_font)
+        fm = p.fontMetrics()
+
+        margin_r = 8
+        pad_x = 6
+        pad_y = 3
+        tw = fm.horizontalAdvance(self._kbd)
+        badge_w = tw + pad_x * 2
+        badge_h = fm.height() + pad_y * 2
+        bx = self.width() - badge_w - margin_r
+        by = (self.height() - badge_h) // 2
+
+        rect = QRectF(bx, by, badge_w, badge_h)
+        p.setBrush(QColor(255, 255, 255, 10))
+        p.setPen(QColor(255, 255, 255, 35))
+        p.drawRoundedRect(rect, 4, 4)
+        p.setPen(QColor("#5f6675"))
+        p.drawText(rect, Qt.AlignCenter, self._kbd)
+        p.end()
+
+
 DEFAULT_DARK_APP_QSS = """
-QMainWindow, QWidget { background: #000000; color: #eaeaea; }
+QMainWindow, QWidget { background: #07080b; color: #e7eaf0; }
+QLabel { color: #e7eaf0; background: transparent; }
 
 QGroupBox {
-    border: 1px solid #1f1f1f;
-    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,15);
+    border-radius: 18px;
     margin-top: 10px;
-    padding: 10px;
-    background: #000000;
+    padding: 16px;
+    background: #0e1118;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 6px;
-    color: #cfcfcf;
+    left: 16px;
+    padding: 0 8px;
+    color: #9aa1ae;
     background: transparent;
 }
-QLabel { color: #d8d8d8; background: transparent; }
+
 QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {
-    background: #050505;
-    border: 1px solid #1f1f1f;
-    border-radius: 10px;
+    background: #0a0c11;
+    border: 1px solid rgba(255,255,255,15);
+    border-radius: 12px;
     padding: 8px 10px;
-    color: #f0f0f0;
+    color: #e7eaf0;
 }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 28px;
     border-left: none;
-    background: #050505;
-    border-top-right-radius: 10px;
-    border-bottom-right-radius: 10px;
+    background: #0a0c11;
+    border-top-right-radius: 12px;
+    border-bottom-right-radius: 12px;
 }
 QComboBox::down-arrow {
     width: 10px;
     height: 10px;
     margin-right: 6px;
 }
+
 QPushButton {
-    background: #0b0b0b;
-    border: 1px solid #1f1f1f;
+    background: #0f1218;
+    border: 1px solid rgba(255,255,255,31);
     border-radius: 12px;
-    padding: 10px 12px;
-    color: #f0f0f0;
+    padding: 11px 14px;
+    color: #e7eaf0;
+    font-weight: 500;
 }
-QPushButton:hover { border: 1px solid #666666; background: #101010; }
-QPushButton:pressed { background: #070707; }
-QPushButton:checked { background: #1a1a1a; border: 1px solid #9a9a9a; font-weight: 600; }
-QPushButton[primary="true"] { background: #1a1a1a; border: 1px solid #8a8a8a; font-weight: 700; }
-QPushButton[primary="true"]:hover { background: #202020; border: 1px solid #b0b0b0; }
-QPushButton[danger="true"] { background: #1a0505; border: 1px solid #6a2a2a; color: #ffd3d3; }
-QPushButton[danger="true"]:hover { background: #220707; border: 1px solid #a04040; }
-QPushButton[success="true"] { background: #051a05; border: 1px solid #2a6a2a; color: #b0ffb0; font-weight: 700; }
-QPushButton[success="true"]:hover { background: #072207; border: 1px solid #40a040; }
-QProgressBar {
-    border: 1px solid #1f1f1f;
-    border-radius: 10px;
-    text-align: center;
-    background: #050505;
-    color: #eaeaea;
-    height: 18px;
-}
-QProgressBar::chunk { background: #00aa00; border-radius: 10px; }
-QHeaderView::section {
-    background: #050505;
-    border: 1px solid #111111;
-    padding: 6px;
-    color: #dcdcdc;
-}
-QTableCornerButton::section { background: #050505; border: 1px solid #111111; }
-QTableWidget, QTableView, QTableWidget::viewport, QTableView::viewport {
-    background: #000000;
-    color: #eaeaea;
-    border: 1px solid #1f1f1f;
-    gridline-color: #161616;
-    selection-background-color: #1a1a1a;
-    selection-color: #ffffff;
-}
-QTableWidget::item { background: #000000; color: #eaeaea; }
-QTableWidget::item:selected { background: #1a1a1a; color: #ffffff; }
-QRadioButton, QCheckBox { color: #eaeaea; background: transparent; spacing: 8px; }
-QRadioButton::indicator, QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-}
-QRadioButton::indicator {
-    border: 1px solid #6b7280;
-    border-radius: 8px;
-    background: #050505;
-}
-QRadioButton::indicator:checked {
-    border: 1px solid #b8bec8;
-    background: #f3f4f6;
-}
-QCheckBox::indicator {
-    border: 1px solid #6b7280;
-    border-radius: 4px;
-    background: #050505;
-}
-QCheckBox::indicator:checked {
-    border: 1px solid #9ca3af;
-    background: #22c55e;
-}
-QSlider::groove:horizontal {
-    border: none;
-    height: 6px;
-    background: #1f2937;
-    border-radius: 3px;
-}
-QSlider::sub-page:horizontal {
-    background: #4b5563;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #f3f4f6;
-    border: 1px solid #9ca3af;
-    width: 16px;
-    margin: -5px 0;
-    border-radius: 8px;
-}
-"""
-LIGHT_APP_QSS = """
-* {
-  font-family: "Inter", "SF Pro Display", "SF Pro Text", "Segoe UI", Arial;
-  font-size: 13px;
-  color: rgba(25,30,38,220);
-}
-
-QMainWindow, QWidget { background: #f4f5f7; }
-QLabel { background: transparent; }
-
-QPushButton:focus,
-QRadioButton:focus,
-QSpinBox:focus,
-QTableWidget:focus {
-  outline: none;
-}
-
-QGroupBox {
-  border: 1px solid rgba(28,34,45,18);
-  border-radius: 18px;
-  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                              stop:0 rgba(255,255,255,235),
-                              stop:1 rgba(246,248,251,245));
-  margin-top: 10px;
-  padding: 16px;
-}
-
-QGroupBox::title {
-  subcontrol-origin: margin;
-  left: 16px;
-  top: 12px;
-  padding: 0 8px;
-  color: rgba(37,44,54,150);
-  font-weight: 700;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  background: transparent;
-}
-
-QGroupBox#ControlsPanel,
-QGroupBox#PostPanel {
-  border-radius: 22px;
-  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                              stop:0 rgba(255,255,255,242),
-                              stop:1 rgba(244,246,249,247));
-}
-
-QPushButton {
-  background: rgba(248,250,252,235);
-  border: 1px solid rgba(88,102,119,42);
-  border-radius: 14px;
-  padding: 12px 14px;
-  font-weight: 600;
-}
-
-QPushButton:hover {
-  border: 1px solid rgba(88,102,119,64);
-  background: rgba(252,253,255,245);
-}
-
-QPushButton:pressed {
-  background: rgba(224,230,237,245);
-  border: 1px solid rgba(88,102,119,82);
-}
-
+QPushButton:hover { border: 1px solid rgba(138,180,255,115); background: #141921; }
+QPushButton:pressed { background: #080a0f; }
 QPushButton[primary="true"] {
-  background: rgba(218,228,238,240);
-  border: 1px solid rgba(108,129,147,120);
-  font-weight: 800;
+    background: #192e52;
+    border: 1px solid rgba(138,180,255,140);
+    font-weight: 600;
 }
-QPushButton[primary="true"]:hover {
-  background: rgba(211,224,236,250);
-  border: 1px solid rgba(88,113,133,145);
-}
-QPushButton[primary="true"]:pressed {
-  background: rgba(197,212,226,255);
-  border: 1px solid rgba(71,93,111,170);
-}
-
-QPushButton[danger="true"] {
-  background: rgba(255,92,92,18);
-  border: 1px solid rgba(220,87,87,70);
-  color: rgba(140,35,35,245);
-  font-weight: 800;
-}
-QPushButton[danger="true"]:hover {
-  background: rgba(255,92,92,24);
-  border: 1px solid rgba(220,87,87,95);
-}
-QPushButton[danger="true"]:pressed {
-  background: rgba(238,208,208,255);
-  border: 1px solid rgba(200,70,70,115);
-}
-QPushButton[success="true"] {
-  background: rgba(60,180,60,30);
-  border: 1px solid rgba(60,160,60,120);
-  color: rgba(20,100,20,245);
-  font-weight: 800;
-}
-QPushButton[success="true"]:hover {
-  background: rgba(60,180,60,50);
-  border: 1px solid rgba(40,140,40,160);
-}
-
-QPushButton[tool="true"] {
-  text-align: left;
-  padding: 14px 14px;
-  border-radius: 16px;
-  background: rgba(249,251,253,220);
-  border: 1px solid rgba(88,102,119,38);
-  color: rgba(32,39,48,185);
-}
-
-QPushButton[tool="true"]:hover {
-  background: rgba(240,245,249,240);
-  border: 1px solid rgba(96,113,131,60);
-}
-
-QPushButton[tool="true"]:checked {
-  background: rgba(214,225,235,180);
-  border: 2px solid rgba(108,129,147,125);
-  color: rgba(22,27,34,245);
-  font-weight: 900;
-}
-
-QPushButton[tool="true"]:pressed {
-  background: rgba(204,214,224,210);
-  border: 2px solid rgba(96,113,131,95);
-  padding: 14px 14px;
-}
-
-QLineEdit {
-  background: rgba(255,255,255,190);
-  border: 1px solid rgba(31,41,55,12);
-  border-radius: 14px;
-  padding: 10px 12px;
-  color: rgba(20,24,31,230);
-}
-
-QComboBox, QSpinBox, QPlainTextEdit {
-  background: rgba(255,255,255,190);
-  border: 1px solid rgba(31,41,55,12);
-  border-radius: 12px;
-  padding: 6px 10px;
-  color: rgba(20,24,31,230);
-}
-
-QComboBox::drop-down {
-  subcontrol-origin: padding;
-  subcontrol-position: top right;
-  width: 28px;
-  border-left: none;
-  background: rgba(255,255,255,190);
-  border-top-right-radius: 12px;
-  border-bottom-right-radius: 12px;
-}
-
-QComboBox::down-arrow {
-  image: url("__LIGHT_COMBO_ARROW_PATH__");
-  width: 10px;
-  height: 10px;
-  margin-right: 6px;
-}
-
-QComboBox QAbstractItemView {
-  background: rgba(255,255,255,248);
-  border: none;
-  selection-background-color: rgba(255,255,255,248);
-  selection-color: rgba(20,24,31,230);
-  outline: 0;
-}
-
-QComboBox QAbstractItemView::item {
-  background: rgba(255,255,255,248);
-  color: rgba(20,24,31,230);
-  min-height: 20px;
-}
-
-QComboBox QAbstractItemView::item:selected {
-  background: rgba(255,255,255,248);
-  color: rgba(20,24,31,230);
-}
-
-QCheckBox::indicator {
-  width: 16px;
-  height: 16px;
-  border: 1px solid #c9c9c9;
-  border-radius: 3px;
-  background: #f7f7f7;
-}
-
-QCheckBox::indicator:checked {
-  image: url("ui_assets/checkmark_dark.svg");
-  border: 1px solid #c9c9c9;
-  border-radius: 3px;
-  background: #f7f7f7;
-}
-
-QTableWidget::indicator {
-  width: 16px;
-  height: 16px;
-  border: 1px solid #c9c9c9;
-  border-radius: 3px;
-  background: #f7f7f7;
-}
-
-QTableWidget::indicator:unchecked {
-  border: 1px solid #c9c9c9;
-  border-radius: 3px;
-  background: #f7f7f7;
-}
-
-QTableWidget::indicator:checked {
-  image: url("ui_assets/checkmark_dark.svg");
-  border: 1px solid #c9c9c9;
-  border-radius: 3px;
-  background: #f7f7f7;
-}
-
-QSpinBox {
-  padding: 6px 26px 6px 10px;
-}
-
-QSpinBox::up-button, QSpinBox::down-button {
-  subcontrol-origin: border;
-  width: 18px;
-  border: none;
-  background: rgba(31,41,55,6);
-}
-QSpinBox::up-button {
-  subcontrol-position: top right;
-  border-top-right-radius: 12px;
-}
-QSpinBox::down-button {
-  subcontrol-position: bottom right;
-  border-bottom-right-radius: 12px;
-}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-  background: rgba(31,41,55,10);
-}
-QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {
-  background: rgba(31,41,55,16);
-}
-QSpinBox::up-arrow, QSpinBox::down-arrow {
-  width: 8px;
-  height: 8px;
-}
-
-QRadioButton[seg="true"] {
-  padding: 10px 16px;
-  border: 1px solid rgba(31,41,55,12);
-  border-radius: 16px;
-  background: rgba(255,255,255,120);
-  color: rgba(46,53,63,150);
-  font-weight: 700;
-}
-QRadioButton[seg="true"]::indicator { width: 0px; height: 0px; }
-QRadioButton[seg="true"]:hover {
-  border: 1px solid rgba(31,41,55,18);
-  background: rgba(250,251,253,220);
-}
-QRadioButton[seg="true"]:checked {
-  color: rgba(25,30,38,240);
-  background: rgba(215,224,233,185);
-  border: 1px solid rgba(108,129,147,115);
-}
-
-#PreviewCanvas {
-  background: rgba(255,255,255,120);
-  border: 1px solid rgba(31,41,55,10);
-  border-radius: 18px;
-}
-
-QTableWidget {
-  background: rgba(255,255,255,150);
-  border: 1px solid rgba(31,41,55,6);
-  border-radius: 10px;
-  gridline-color: rgba(31,41,55,5);
-  color: rgba(20,24,31,230);
-}
-
-QTableWidget::viewport {
-  background: rgba(0,0,0,0);
-}
-
-QTableCornerButton::section {
-  background: rgba(0,0,0,0);
-  border: none;
-}
-
-QHeaderView::section {
-  background: transparent;
-  border: none;
-  padding: 14px 10px;
-  color: rgba(44,50,59,120);
-  font-weight: 800;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-}
-
-QTableWidget::item {
-  padding: 9px 8px;
-  border-bottom: 1px solid rgba(31,41,55,5);
-  background: rgba(0,0,0,0);
-  color: rgba(20,24,31,220);
-}
-
-QTableWidget::item:selected {
-  background: rgba(214,225,235,170);
-}
+QPushButton[primary="true"]:hover { background: #1e3660; border: 1px solid rgba(138,180,255,191); }
+QPushButton[danger="true"] { background: #3a0f0f; border: 1px solid rgba(255,133,133,128); color: #ffd3d3; }
+QPushButton[danger="true"]:hover { background: #441212; border: 1px solid rgba(255,133,133,165); }
+QPushButton[success="true"] { background: #163a20; border: 1px solid rgba(140,230,164,140); color: #d6f5de; font-weight: 700; }
+QPushButton[success="true"]:hover { background: #1a4426; border: 1px solid rgba(140,230,164,191); }
 
 QProgressBar {
-  border: 1px solid rgba(31,41,55,10);
-  border-radius: 999px;
-  text-align: center;
-  background: rgba(255,255,255,130);
-  color: rgba(20,24,31,220);
-  height: 18px;
+    border: 1px solid rgba(255,255,255,15);
+    border-radius: 5px;
+    background: #0a0c11;
+    color: transparent;
+    min-height: 10px;
+    max-height: 10px;
+    padding: 1px;
 }
-QProgressBar::chunk {
-  background: #16a34a;
-  border-radius: 999px;
-}
+QProgressBar::chunk { background: #3dc66a; border-radius: 4px; }
 
-QSlider::groove:horizontal {
-  border: none;
-  height: 6px;
-  background: #1f2937;
-  border-radius: 3px;
+QHeaderView::section {
+    background: rgba(255,255,255,4);
+    border: none;
+    border-bottom: 1px solid rgba(255,255,255,13);
+    padding: 6px;
+    color: #5f6675;
 }
-QSlider::sub-page:horizontal {
-  background: #4b5563;
-  border-radius: 3px;
+QTableCornerButton::section { background: transparent; border: none; }
+QTableWidget, QTableView, QTableWidget::viewport, QTableView::viewport {
+    background: #0d0f14;
+    color: #e7eaf0;
+    border: 1px solid rgba(255,255,255,13);
+    gridline-color: rgba(255,255,255,10);
+    selection-background-color: rgba(138,180,255,22);
+    selection-color: #e7eaf0;
 }
-QSlider::handle:horizontal {
-  background: #f3f4f6;
-  border: 1px solid #9ca3af;
-  width: 16px;
-  margin: -5px 0;
-  border-radius: 8px;
-}
-""".replace("__LIGHT_COMBO_ARROW_PATH__", LIGHT_COMBO_ARROW_PATH)
-
+QTableWidget::item { background: transparent; color: #e7eaf0; }
+QTableWidget::item:selected { background: rgba(138,180,255,22); color: #e7eaf0; }
+QRadioButton, QCheckBox { color: #e7eaf0; background: transparent; spacing: 8px; }
+QRadioButton::indicator, QCheckBox::indicator { width: 16px; height: 16px; }
+QRadioButton::indicator { border: 1px solid rgba(255,255,255,31); border-radius: 8px; background: #0a0c11; }
+QRadioButton::indicator:checked { border: 1px solid rgba(138,180,255,191); background: #f2f5fb; }
+QCheckBox::indicator { border: 1px solid rgba(255,255,255,31); border-radius: 4px; background: #0a0c11; }
+QCheckBox::indicator:checked { border: 1px solid rgba(138,180,255,191); background: #1f3a6e; }
+QSlider::groove:horizontal { border: none; height: 4px; background: #1d2029; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #4781d1; border-radius: 2px; }
+QSlider::handle:horizontal { background: #f2f5fb; border: 1px solid rgba(0,0,0,100); width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
+"""
 
 # ----------------------------
 # IO + image helpers
@@ -720,7 +519,7 @@ def make_output_ids_for_image(img_path: str) -> Tuple[str, str]:
 # Interactive image widget (Zoom/Pan overlay buttons + drag paint support)
 # ----------------------------
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize
-from PySide6.QtGui import QImage, QPixmap, QPainter
+
 from PySide6.QtWidgets import QWidget, QToolButton, QSizePolicy
 import numpy as np
 
@@ -749,6 +548,9 @@ class ZoomPanCanvas(QWidget):
         self._pan_x = 0.0
         self._pan_y = 0.0
 
+        # Count overlay lines: list of (text, color_hex, is_big)
+        self._count_overlay_lines: list = []
+
         self._pan_mode = False
         self._panning = False
         self._left_down = False
@@ -764,37 +566,44 @@ class ZoomPanCanvas(QWidget):
         self.btn_zoom_in = QToolButton(self); self.btn_zoom_in.setText("+")
         self.btn_zoom_out = QToolButton(self); self.btn_zoom_out.setText("−")
         self.btn_pan = QToolButton(self); self.btn_pan.setText("↔"); self.btn_pan.setCheckable(True)
+        self.btn_reset_view = QToolButton(self); self.btn_reset_view.setText("⌂")
 
-        for b in (self.btn_zoom_in, self.btn_zoom_out, self.btn_pan):
+        for b in (self.btn_zoom_in, self.btn_zoom_out, self.btn_pan, self.btn_reset_view):
             b.setAutoRaise(True)
             b.setCursor(Qt.PointingHandCursor)
             b.hide()
 
         tool_css = """
         QToolButton {
-            background: rgba(10,10,10,200);
-            border: 1px solid rgba(180,180,180,80);
-            color: white;
+            background: rgba(10,12,18,200);
+            border: 1px solid rgba(255,255,255,31);
+            color: #e7eaf0;
             border-radius: 10px;
             padding: 6px 10px;
             font-weight: 700;
         }
         QToolButton:hover {
-            border: 1px solid rgba(255,255,255,160);
-            background: rgba(20,20,20,220);
+            border: 1px solid rgba(138,180,255,150);
+            background: rgba(20,24,34,220);
         }
         QToolButton:checked {
-            border: 1px solid rgba(255,255,255,200);
-            background: rgba(30,30,30,230);
+            border: 1px solid rgba(138,180,255,200);
+            background: rgba(25,43,72,200);
+        }
+        QToolButton:pressed {
+            background: rgba(10,12,18,230);
+            border: 1px solid rgba(138,180,255,100);
         }
         """
         self.btn_zoom_in.setStyleSheet(tool_css)
         self.btn_zoom_out.setStyleSheet(tool_css)
         self.btn_pan.setStyleSheet(tool_css)
+        self.btn_reset_view.setStyleSheet(tool_css)
 
         self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(1.15))
         self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(1.0 / 1.15))
         self.btn_pan.toggled.connect(self.set_pan_mode)
+        self.btn_reset_view.clicked.connect(self.reset_view)
 
     # prevent QLabel-like pixmap sizeHint behavior
     def sizeHint(self):
@@ -823,8 +632,76 @@ class ZoomPanCanvas(QWidget):
         self._img_w = 0
         self._img_h = 0
         self._bytes_per_line = 0
+        self._count_overlay_lines = []
         self.update()
         self.view_changed.emit()
+
+    def set_count_overlay(self, lines: list):
+        """Set count overlay lines painted at bottom-left of canvas.
+        lines: list of (text: str, color_hex: str, is_big: bool)
+        """
+        self._count_overlay_lines = lines
+        self.update()
+
+    def _paint_count_overlay(self, painter):
+        """Paint count info overlay labels at bottom-left of the canvas."""
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+
+        pad_x, pad_y = 18, 18
+        gap = 5
+        corner_r = 8
+        px_h_big, px_w_big = 8, 14   # padding for the big count pill
+        px_h_sm,  px_w_sm  = 5, 10   # padding for small lines
+
+        big_font = QFont("Geist Mono")
+        big_font.setStyleHint(QFont.Monospace)
+        big_font.setPointSizeF(20.0)
+        big_font.setBold(True)
+        big_font.setLetterSpacing(QFont.AbsoluteSpacing, -0.3)
+
+        small_font = QFont("Geist Mono")
+        small_font.setStyleHint(QFont.Monospace)
+        small_font.setPointSizeF(9.5)
+        small_font.setBold(False)
+
+        # Measure each line
+        box_list = []
+        for text, color_hex, is_big in self._count_overlay_lines:
+            painter.setFont(big_font if is_big else small_font)
+            fm = painter.fontMetrics()
+            pw = px_w_big if is_big else px_w_sm
+            ph = px_h_big if is_big else px_h_sm
+            bw = fm.horizontalAdvance(text) + pw * 2
+            bh = fm.height() + ph * 2
+            box_list.append((text, color_hex, is_big, bw, bh, pw, ph))
+
+        start_x = pad_x
+        start_y = pad_y   # fixed top-left, zoom-independent
+
+        y_off = 0
+        for text, color_hex, is_big, bw, bh, pw, ph in box_list:
+            painter.setFont(big_font if is_big else small_font)
+            rect = QRectF(start_x, start_y + y_off, bw, bh)
+            if is_big:
+                # Amber pill — coin style matching .overlay-labels .big
+                painter.setBrush(QColor(0, 0, 0, 140))
+                painter.setPen(QColor(255, 214, 107, 60))   # subtle amber border
+                painter.drawRoundedRect(rect, corner_r, corner_r)
+                painter.setPen(QColor("#ffd66b"))
+            else:
+                painter.setBrush(QColor(0, 0, 0, 145))
+                painter.setPen(QColor(255, 255, 255, 18))
+                painter.drawRoundedRect(rect, corner_r, corner_r)
+                painter.setPen(QColor(color_hex))
+            painter.drawText(
+                rect.adjusted(pw, ph, -pw, -ph),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                text,
+            )
+            y_off += bh + gap
+
+        painter.setBrush(Qt.NoBrush)
 
     def _advance_empty_animation(self):
         if self._rgb is not None:
@@ -848,11 +725,13 @@ class ZoomPanCanvas(QWidget):
         super().enterEvent(e)
         if self._rgb is not None:
             self._place_overlay_buttons()
-            self.btn_zoom_in.show(); self.btn_zoom_out.show(); self.btn_pan.show()
+            self.btn_zoom_in.show(); self.btn_zoom_out.show()
+            self.btn_pan.show(); self.btn_reset_view.show()
 
     def leaveEvent(self, e):
         super().leaveEvent(e)
-        self.btn_zoom_in.hide(); self.btn_zoom_out.hide(); self.btn_pan.hide()
+        self.btn_zoom_in.hide(); self.btn_zoom_out.hide()
+        self.btn_pan.hide(); self.btn_reset_view.hide()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -870,11 +749,13 @@ class ZoomPanCanvas(QWidget):
         pad = 10
         w = 38
         h = 32
+        gap = 8
         x = self.width() - pad - w
         y = pad
         self.btn_zoom_in.setGeometry(QRect(x, y, w, h))
-        self.btn_zoom_out.setGeometry(QRect(x, y + h + 8, w, h))
-        self.btn_pan.setGeometry(QRect(x, y + (h + 8) * 2, w, h))
+        self.btn_zoom_out.setGeometry(QRect(x, y + (h + gap), w, h))
+        self.btn_pan.setGeometry(QRect(x, y + (h + gap) * 2, w, h))
+        self.btn_reset_view.setGeometry(QRect(x, y + (h + gap) * 3, w, h))
 
     def wheelEvent(self, e):
         if self._rgb is None:
@@ -985,6 +866,10 @@ class ZoomPanCanvas(QWidget):
         pm = QPixmap.fromImage(qimg).scaled(disp_w, disp_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
         painter.drawPixmap(off_x, off_y, pm)
+
+        if self._count_overlay_lines:
+            self._paint_count_overlay(painter)
+
         painter.end()
 
     def _paint_empty_state(self, painter: QPainter):
@@ -1237,55 +1122,110 @@ class ProcessImagesTask(QRunnable):
 
 
 class SSHJobSignals(QObject):
-    status = Signal(str)
-    finished = Signal(object)  # list of local output paths
-    error = Signal(str)
+    status   = Signal(str)
+    progress = Signal(int)      # 0-100
+    finished = Signal(object)   # list of local output paths
+    error    = Signal(str)
+
+
+class _ConnCheckerSignals(QObject):
+    result = Signal(str, str)   # (state, detail)
+
+
+class _ConnCheckerTask(QRunnable):
+    """Off-main-thread task: checks Tailscale login then SSH-pings the GPU server.
+
+    Emits result(state, detail) where state is one of:
+      'no_tailscale' | 'not_logged_in' | 'server_down' | 'connected'
+    """
+
+    def __init__(self, host: str, port: int, user: str, key_file: str,
+                 signals: _ConnCheckerSignals):
+        super().__init__()
+        self.host     = host
+        self.port     = port
+        self.user     = user
+        self.key_file = str(Path(key_file).expanduser())
+        self.signals  = signals
+
+    def run(self):
+        # ── 1. Tailscale login state ─────────────────────────────────────────
+        try:
+            r = subprocess.run(
+                ["tailscale", "status", "--json"],
+                capture_output=True, text=True, timeout=5
+            )
+            try:
+                data = json.loads(r.stdout)
+                backend = data.get("BackendState", "")
+                if backend in ("NeedsLogin", "NoState", "Stopped"):
+                    self.signals.result.emit("not_logged_in", backend)
+                    return
+            except (json.JSONDecodeError, ValueError):
+                pass  # tailscale running but output unparseable — try SSH anyway
+        except FileNotFoundError:
+            self.signals.result.emit("no_tailscale", "tailscale binary not found")
+            return
+        except Exception:
+            pass  # tailscale status check failed; try SSH anyway
+
+        # ── 2. SSH ping ──────────────────────────────────────────────────────
+        if not Path(self.key_file).exists():
+            self.signals.result.emit("server_down",
+                                     f"SSH key not found: {self.key_file}")
+            return
+        try:
+            r = subprocess.run(
+                [
+                    "ssh",
+                    "-p", str(self.port),
+                    "-i", self.key_file,
+                    "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=5",
+                    f"{self.user}@{self.host}",
+                    "echo ok",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                self.signals.result.emit("connected", self.host)
+            else:
+                detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+                self.signals.result.emit("server_down", detail)
+        except Exception as exc:
+            self.signals.result.emit("server_down", str(exc))
 
 
 class _SetupSignals(QObject):
     """Signals for the background SSH key-setup runnable."""
     log_msg  = Signal(str)
-    finished = Signal(bool, str)   # (success, error_message)
+    pub_key  = Signal(str)          # emits the public key text once generated
+    finished = Signal(bool, str)    # (success, error_message)
 
 
 class _SetupRunnable(QRunnable):
-    """Runs SSH key generation + installation + verification in a worker thread.
+    """Generates an SSH key (if needed) then tests the connection.
 
-    All blocking I/O (paramiko, subprocess) happens here; results are
-    communicated back to the wizard via signals — no processEvents() needed.
+    No password / paramiko required — key installation is done manually once
+    via the public key shown in the wizard log.
 
     IMPORTANT: `signals` must be created and owned by the caller (main thread).
-    The runnable only borrows the reference.  If the runnable owned the QObject
-    itself, Qt's thread pool would destroy it from the worker thread after run()
-    returns, which races with queued signal delivery on the main thread → SIGSEGV.
     """
 
-    def __init__(self, host: str, port: int, username: str,
-                 password: str, key_path: "Path",
+    def __init__(self, host: str, port: int, username: str, key_path: "Path",
                  signals: "_SetupSignals"):
         super().__init__()
         self.host     = host
         self.port     = port
         self.username = username
-        self.password = password
         self.key_path = key_path
-        self.signals  = signals   # borrowed — caller must keep alive
+        self.signals  = signals
 
     def run(self):
         try:
-            import paramiko
-        except ImportError:
-            self.signals.finished.emit(
-                False,
-                "paramiko is not installed.\n\n"
-                "Install it with:\n  pip install paramiko\n"
-                "or add it to environment.yml and recreate the conda env."
-            )
-            return
-
-        try:
             # ── Step 1: generate SSH key if absent ────────────────────────
-            self.signals.log_msg.emit("[ 1 / 3 ]  Checking SSH key ...")
+            self.signals.log_msg.emit("[ 1 / 2 ]  Checking SSH key ...")
             self.key_path.parent.mkdir(parents=True, exist_ok=True)
             pub_path = Path(str(self.key_path) + ".pub")
 
@@ -1297,142 +1237,101 @@ class _SetupRunnable(QRunnable):
                 )
                 if r.returncode != 0:
                     raise RuntimeError(f"ssh-keygen failed:\n{r.stderr}")
-                self.signals.log_msg.emit("  ✓ Key generated")
+                self.signals.log_msg.emit("  ✓ New key generated")
             else:
                 self.signals.log_msg.emit("  ✓ Key already exists — reusing it")
 
             pubkey = pub_path.read_text().strip()
+            self.signals.pub_key.emit(pubkey)
 
-            # ── Step 2: install key on GPU machine via password auth ──────
+            # ── Step 2: test connection with key ──────────────────────────
             self.signals.log_msg.emit(
-                f"\n[ 2 / 3 ]  Connecting to {self.username}@{self.host} with password ..."
+                f"\n[ 2 / 2 ]  Testing connection to {self.username}@{self.host} ..."
             )
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            try:
-                client.connect(
-                    hostname=self.host, port=self.port,
-                    username=self.username, password=self.password,
-                    timeout=20, allow_agent=False, look_for_keys=False,
-                )
-            except paramiko.AuthenticationException:
-                raise RuntimeError(
-                    "Password incorrect or password login is disabled on the GPU machine.\n"
-                    "Check the username and password and try again."
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    f"Could not reach {self.host}:{self.port} — {e}\n\n"
-                    "Make sure Tailscale is running on both machines and the "
-                    "GPU machine's IP is correct."
-                )
-
-            self.signals.log_msg.emit("  ✓ Connected with password")
-            self.signals.log_msg.emit("  Installing key in ~/.ssh/authorized_keys ...")
-
-            # Idempotent: append key only if not already present
-            install_cmd = (
-                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
-                f"grep -qxF {shlex.quote(pubkey)} ~/.ssh/authorized_keys 2>/dev/null "
-                f"|| echo {shlex.quote(pubkey)} >> ~/.ssh/authorized_keys && "
-                "chmod 600 ~/.ssh/authorized_keys"
+            r = subprocess.run(
+                [
+                    "ssh",
+                    "-p", str(self.port),
+                    "-i", str(self.key_path),
+                    "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=12",
+                    f"{self.username}@{self.host}",
+                    "echo cara_ok",
+                ],
+                capture_output=True, text=True, timeout=20,
             )
-            _, stdout, stderr = client.exec_command(install_cmd)
-            exit_code = stdout.channel.recv_exit_status()
-            client.close()
-
-            if exit_code != 0:
-                err = stderr.read().decode().strip()
-                raise RuntimeError(f"Key installation failed (exit {exit_code}):\n{err}")
-            self.signals.log_msg.emit("  ✓ Key installed")
-
-            # ── Step 3: verify key-only login works ───────────────────────
-            self.signals.log_msg.emit("\n[ 3 / 3 ]  Verifying key login (no password) ...")
-            client2 = paramiko.SSHClient()
-            client2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client2.connect(
-                hostname=self.host, port=self.port,
-                username=self.username,
-                key_filename=str(self.key_path),
-                timeout=15, allow_agent=False, look_for_keys=False,
-            )
-            _, out2, _ = client2.exec_command("echo cara_ok")
-            got = out2.read().decode().strip()
-            client2.close()
-
-            if got != "cara_ok":
-                raise RuntimeError(
-                    f"Key login test failed (got {got!r} instead of 'cara_ok')."
+            if r.returncode == 0 and "cara_ok" in r.stdout:
+                self.signals.log_msg.emit("  ✓ Connection successful!")
+                self.signals.log_msg.emit(
+                    "\n✓ Setup complete — the app will connect automatically."
                 )
-            self.signals.log_msg.emit("  ✓ Key login works perfectly")
-            self.signals.log_msg.emit("\n✓ Setup complete!  The app will now connect automatically.")
-            self.signals.finished.emit(True, "")
-
+                self.signals.finished.emit(True, "")
+            else:
+                detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+                raise RuntimeError(
+                    f"SSH connection test failed:\n{detail}\n\n"
+                    "Make sure the public key shown above has been added to\n"
+                    "~/.ssh/authorized_keys on the GPU machine, and that\n"
+                    "Tailscale is running on both computers."
+                )
         except Exception as exc:
             self.signals.finished.emit(False, str(exc))
 
 
 class GPUSetupWizard(QDialog):
-    """First-time setup wizard for the GPU server connection.
-
-    Uses the user's password exactly once (via paramiko) to install an SSH key.
-    After that, the app connects automatically — no password, no terminal needed.
-    Works on any laptop: just run the app, enter the password once, done.
-    """
+    """SSH key setup + connection test — no password required."""
 
     def __init__(self, parent, host: str, port: int, username: str, key_path: "Path"):
         super().__init__(parent)
-        self.host = host
-        self.port = port
+        self.host     = host
+        self.port     = port
         self.username = username
         self.key_path = Path(key_path).expanduser()
         self.setup_ok = False
 
-        self.setWindowTitle("GPU Server — First-Time Setup")
-        self.resize(580, 460)
+        self.setWindowTitle("GPU Server — SSH Setup")
+        self.resize(600, 480)
         self.setModal(True)
 
         lay = QVBoxLayout(self)
 
         intro = QLabel(
-            "<b>One-time setup</b> — takes about 10 seconds.<br><br>"
-            "The app will generate a secure SSH key and install it on your GPU "
-            "machine using your password. After this, no password is ever needed "
-            "again — the app connects automatically from any laptop."
+            "<b>One-time SSH key setup</b><br><br>"
+            "The app will generate a secure key (if needed) and test the connection. "
+            "If the key is new, copy the public key shown in the log and add it to "
+            "<code>~/.ssh/authorized_keys</code> on your GPU machine, then click "
+            "<b>Verify Connection</b> again."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.RichText)
         lay.addWidget(intro)
 
         form = QGridLayout()
-        form.setColumnMinimumWidth(0, 130)
+        form.setColumnMinimumWidth(0, 140)
         self.host_edit = QLineEdit(host)
         self.user_edit = QLineEdit(username)
-        self.pass_edit = QLineEdit()
-        self.pass_edit.setEchoMode(QLineEdit.Password)
-        self.pass_edit.setPlaceholderText("Your password on the GPU machine")
-        self.pass_edit.returnPressed.connect(self._run_setup)
+        self.host_edit.returnPressed.connect(self._run_setup)
+        self.user_edit.returnPressed.connect(self._run_setup)
         form.addWidget(QLabel("Host / Tailscale IP"), 0, 0)
         form.addWidget(self.host_edit, 0, 1)
         form.addWidget(QLabel("Username"), 1, 0)
         form.addWidget(self.user_edit, 1, 1)
-        form.addWidget(QLabel("Password (used once)"), 2, 0)
-        form.addWidget(self.pass_edit, 2, 1)
-        note = QLabel("Password is used only to install the key and is never stored.")
-        note.setStyleSheet("color: #9aa0a6; font-size: 11px;")
-        form.addWidget(note, 3, 1)
+        key_note = QLabel(f"Key file: {self.key_path}")
+        key_note.setStyleSheet("color: #5f6675; font-size: 11px;")
+        form.addWidget(key_note, 2, 1)
         lay.addLayout(form)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(200)
-        self.log.setFixedHeight(140)
+        self.log.setMaximumBlockCount(400)
+        self.log.setMinimumHeight(160)
         lay.addWidget(self.log)
 
         btn_row = QWidget()
         blay = QHBoxLayout(btn_row)
         blay.setContentsMargins(0, 0, 0, 0)
-        self.btn_setup = QPushButton("Connect && Set Up")
+        self.btn_setup = QPushButton("Generate Key && Verify Connection")
         self.btn_setup.setProperty("primary", True)
         btn_cancel = QPushButton("Cancel")
         blay.addWidget(self.btn_setup)
@@ -1443,14 +1342,19 @@ class GPUSetupWizard(QDialog):
         self.btn_setup.clicked.connect(self._run_setup)
         btn_cancel.clicked.connect(self.reject)
 
-    # ── slots (always called from the GUI thread via Qt signal delivery) ─────
+    # ── slots ─────────────────────────────────────────────────────────────────
 
     def _append_log(self, msg: str):
-        """Slot — appends a line to the log widget. Called via signal, never directly."""
         self.log.appendPlainText(msg)
 
+    def _on_pub_key(self, pubkey: str):
+        self.log.appendPlainText(
+            "\n── Public key (add this to ~/.ssh/authorized_keys on the GPU machine) ──\n"
+            f"{pubkey}\n"
+            "────────────────────────────────────────────────────────────────────────"
+        )
+
     def _on_setup_finished(self, success: bool, error_msg: str):
-        """Slot — called when the background runnable finishes."""
         if success:
             _s = QSettings("CARA", "CPSAMGPUServer")
             _s.setValue("gpu_host",   self.host_edit.text().strip())
@@ -1458,7 +1362,6 @@ class GPUSetupWizard(QDialog):
             _s.setValue("gpu_key",    str(self.key_path))
             _s.setValue("setup_done", "1")
             _s.sync()
-
             self.setup_ok = True
             self.btn_setup.setText("Done — Close")
             self.btn_setup.setEnabled(True)
@@ -1468,37 +1371,26 @@ class GPUSetupWizard(QDialog):
             self.log.appendPlainText(f"\n✗  {error_msg}")
             self.btn_setup.setEnabled(True)
 
-    # ── kick off background setup ─────────────────────────────────────────────
+    # ── kick off ──────────────────────────────────────────────────────────────
 
     def _run_setup(self):
         host     = self.host_edit.text().strip()
         username = self.user_edit.text().strip()
-        password = self.pass_edit.text()
-
         if not host or not username:
             QMessageBox.warning(self, "Missing fields",
                                 "Please enter Host and Username.")
-            return
-        if not password:
-            QMessageBox.warning(self, "Password required",
-                                "Enter the GPU machine password to install the key.")
             return
 
         self.btn_setup.setEnabled(False)
         self.log.clear()
 
-        # Create the signals object HERE (main thread) and keep it as an instance
-        # attribute so this wizard object holds the only strong reference.
-        # The runnable only borrows it — when the thread pool destroys the
-        # QRunnableWrapper after run() returns, it decrefs the runnable but the
-        # signals QObject stays alive because self._signals still holds it.
         self._signals = _SetupSignals()
         runnable = _SetupRunnable(
             host=host, port=self.port, username=username,
-            password=password, key_path=self.key_path,
-            signals=self._signals,
+            key_path=self.key_path, signals=self._signals,
         )
         self._signals.log_msg.connect(self._append_log)
+        self._signals.pub_key.connect(self._on_pub_key)
         self._signals.finished.connect(self._on_setup_finished)
         QThreadPool.globalInstance().start(runnable)
 
@@ -1600,6 +1492,7 @@ class DirectSSHCPSAMTask(QRunnable):
             self.local_out_dir.mkdir(parents=True, exist_ok=True)
 
             # 1 — verify SSH connection works before doing any work
+            self.signals.progress.emit(2)
             self.signals.status.emit("GPU: checking SSH connection ...")
             rc, _, err = self._ssh("echo connected", timeout=20)
             if rc != 0:
@@ -1613,6 +1506,7 @@ class DirectSSHCPSAMTask(QRunnable):
                 )
 
             # 2 — verify remote_root exists before wasting time uploading
+            self.signals.progress.emit(6)
             self.signals.status.emit("GPU: verifying remote paths ...")
             rc, _, err = self._ssh(
                 f"test -d {shlex.quote(self.remote_root)}", timeout=15
@@ -1636,6 +1530,7 @@ class DirectSSHCPSAMTask(QRunnable):
                 )
 
             # 3a — create remote temp dirs (hidden with _ prefix)
+            self.signals.progress.emit(10)
             self.signals.status.emit("GPU: creating remote temp dirs ...")
             rc, _, err = self._ssh(
                 f"mkdir -p {shlex.quote(remote_in)} {shlex.quote(remote_out)}"
@@ -1643,18 +1538,21 @@ class DirectSSHCPSAMTask(QRunnable):
             if rc != 0:
                 raise RuntimeError(f"Could not create remote directories:\n{err}")
 
-            # 3 — upload images
+            # 3 — upload images  (10 → 40 %)
             total = len(self.image_paths)
             for i, p in enumerate(self.image_paths, 1):
                 src = Path(p)
+                pct = 10 + int(round(i / total * 30))
+                self.signals.progress.emit(pct)
                 self.signals.status.emit(f"GPU: uploading {i}/{total} — {src.name}")
                 rc, _, err = self._scp_up(str(src), remote_in)
                 if rc != 0:
                     raise RuntimeError(f"Upload failed for {src.name}:\n{err}")
 
             # 4 — run CPSAM directly (SSH call blocks until the GPU job finishes)
+            self.signals.progress.emit(42)
             self.signals.status.emit(
-                f"GPU: running CPSAM on {self.host} — waiting for Results ..."
+                f"GPU: running CPSAM on {self.host} — waiting for results ..."
             )
             # Non-interactive SSH shells don't source ~/.bashrc, so conda is
             # not on PATH.  Source the conda init script explicitly first.
@@ -1683,6 +1581,7 @@ class DirectSSHCPSAMTask(QRunnable):
                 )
 
             # 5 — list and download result files
+            self.signals.progress.emit(88)
             self.signals.status.emit("GPU: downloading results ...")
             rc, ls_out, err = self._ssh(
                 f"find {shlex.quote(remote_out)} -maxdepth 1 -type f"
@@ -1697,7 +1596,8 @@ class DirectSSHCPSAMTask(QRunnable):
                     (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".csv", ".txt", ".npy")
                 ):
                     continue
-                local_fp = str(self.local_out_dir / name)
+                clean_stem = Path(name).stem.removesuffix("_overlay")
+                local_fp = str(self.local_out_dir / (clean_stem + Path(name).suffix))
                 self.signals.status.emit(f"GPU: downloading {name} ...")
                 rc, _, err = self._scp_down(remote_fp, local_fp)
                 if rc != 0:
@@ -1705,12 +1605,14 @@ class DirectSSHCPSAMTask(QRunnable):
                 downloaded.append(local_fp)
 
             # 6 — delete all remote temp files (nothing stored permanently on GPU machine)
+            self.signals.progress.emit(97)
             if self.cleanup_remote:
                 self.signals.status.emit("GPU: deleting remote temp files ...")
                 self._ssh(
                     f"rm -rf {shlex.quote(remote_in)} {shlex.quote(remote_out)}"
                 )
 
+            self.signals.progress.emit(100)
             self.signals.status.emit(
                 f"GPU: done — {len(downloaded)} file(s) saved to local output folder."
             )
@@ -1733,7 +1635,6 @@ class MainWindow(QMainWindow):
         self._apply_dark_palette()  # extra fix for macOS white-table bugs
 
         self.thread_pool = QThreadPool.globalInstance()
-        self.theme_mode = "dark"
         qss_path = Path(__file__).resolve().parent / "style.qss"
         self.dark_app_qss = qss_path.read_text(encoding="utf-8") if qss_path.exists() else DEFAULT_DARK_APP_QSS
         self.selected_images: List[str] = []
@@ -1788,13 +1689,13 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.status_lbl = QLabel("Ready.")
         self.status_lbl.setWordWrap(True)
+        self.status_lbl.setObjectName("StatusLabel")
         self._load_gt_counts_csv()
 
         # Logo bottom-left (CENTERED more in controls ribbon)
         self.logo_label = QLabel()
         self.logo_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         self._load_logo()
-        self.btn_theme_toggle = QPushButton("Switch To Light Mode")
 
         # ---- Right panel (preview toggle + preview + table + postprocessing bar)
         self.preview_mode_original = QRadioButton("Original Image")
@@ -1842,12 +1743,16 @@ class MainWindow(QMainWindow):
         # Postprocessing bar
         self.post_box = QGroupBox("Postprocessing")
 
-        self.btn_tool_paint = QPushButton("Paint")
-        self.btn_tool_select = QPushButton("Select")
-        self.btn_tool_remove = QPushButton("Remove")
+        self.btn_tool_paint  = KbdBadgeButton("  Paint",  "P")
+        self.btn_tool_select = KbdBadgeButton("  Select", "S")
+        self.btn_tool_remove = KbdBadgeButton("  Remove", "R")
+        self.btn_tool_paint.setIcon(_make_svg_icon(_ICON_PAINT,  15))
+        self.btn_tool_select.setIcon(_make_svg_icon(_ICON_SELECT, 15))
+        self.btn_tool_remove.setIcon(_make_svg_icon(_ICON_REMOVE, 15))
         for b in (self.btn_tool_paint, self.btn_tool_select, self.btn_tool_remove):
             b.setProperty("tool", True)
             b.setCheckable(True)
+            b.setIconSize(QSize(15, 15))
 
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
@@ -1891,10 +1796,10 @@ class MainWindow(QMainWindow):
         self.btn_clear_annotations = QPushButton("Clear Annotations")
         self.btn_clear_annotations.setProperty("danger", True)
 
-        self.btn_update_count = QPushButton("Update Count")
+        self.btn_update_count = KbdBadgeButton("Update Count", "⌘U")
         self.btn_update_count.setProperty("success", True)
 
-        self.btn_save = QPushButton("Save")
+        self.btn_save = KbdBadgeButton("Save", "⌘S")
         self.btn_save.setProperty("primary", True)
 
 
@@ -1902,7 +1807,7 @@ class MainWindow(QMainWindow):
         for b in (self.btn_tool_paint, self.btn_tool_select, self.btn_tool_remove,
                 self.btn_pick_folder, self.btn_pick_files, self.btn_pick_out,
                 self.btn_process_old, self.btn_process_cpsam, self.btn_web_ui_help,
-                self.btn_clear_annotations, self.btn_update_count, self.btn_save, self.btn_theme_toggle):
+                self.btn_clear_annotations, self.btn_update_count, self.btn_save):
             b.setFocusPolicy(Qt.NoFocus)
 
         self.preview_mode_original.setFocusPolicy(Qt.NoFocus)
@@ -1911,13 +1816,23 @@ class MainWindow(QMainWindow):
         # Layout
         root = QWidget()
         self.setCentralWidget(root)
-        main_layout = QHBoxLayout(root)
+        root_vlay = QVBoxLayout(root)
+        root_vlay.setContentsMargins(8, 8, 8, 8)
+        root_vlay.setSpacing(8)
+
+        title_bar = self._build_title_bar()
+        root_vlay.addWidget(title_bar, 0)
+
+        main_row = QWidget()
+        main_layout = QHBoxLayout(main_row)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
         left = self._build_left_panel()
         right = self._build_right_panel_with_post()
 
         main_layout.addWidget(left, 0)
         main_layout.addWidget(right, 1)
+        root_vlay.addWidget(main_row, 1)
 
         # Signals
         self.btn_pick_folder.clicked.connect(self.on_pick_folder)
@@ -1926,7 +1841,6 @@ class MainWindow(QMainWindow):
         self.btn_process_old.clicked.connect(self.on_process)
         self.btn_process_cpsam.clicked.connect(self.on_open_cpsam_dialog)
         self.btn_web_ui_help.clicked.connect(self.on_web_ui_help)
-        self.btn_theme_toggle.clicked.connect(self.on_toggle_theme)
 
         self.table.itemSelectionChanged.connect(self.on_table_select)
         self.preview_mode_original.toggled.connect(self.on_table_select)
@@ -1943,15 +1857,36 @@ class MainWindow(QMainWindow):
         self.btn_tool_select.toggled.connect(lambda on: self._set_tool("select" if on else None))
         self.btn_tool_remove.toggled.connect(lambda on: self._set_tool("remove" if on else None))
         self._last_paint_xy: Optional[Tuple[int, int]] = None
+        # Coalesce rapid drag events: render at most once per ~16ms (~60fps)
+        self._paint_redraw_pending = False
+        self._paint_redraw_timer = QTimer(self)
+        self._paint_redraw_timer.setSingleShot(True)
+        self._paint_redraw_timer.setInterval(16)
+        self._paint_redraw_timer.timeout.connect(self._flush_paint_redraw)
         self.btn_clear_annotations.clicked.connect(self.on_clear_annotations)
         self.btn_update_count.clicked.connect(self.on_update_count)
         self.btn_save.clicked.connect(self.on_save)
         # Undo shortcut (Cmd+Z on mac, Ctrl+Z elsewhere)
         self.undo_sc = QShortcut(QKeySequence.Undo, self)
         self.undo_sc.activated.connect(self.on_undo)
+        # Save shortcut (Cmd+S on mac, Ctrl+S elsewhere)
+        self.save_sc = QShortcut(QKeySequence.Save, self)
+        self.save_sc.activated.connect(self.on_save)
+        # Tool shortcuts: P = Paint, S = Select, R = Remove
+        self.sc_paint_tool = QShortcut(QKeySequence("P"), self)
+        self.sc_paint_tool.activated.connect(lambda: self.btn_tool_paint.setChecked(True))
+        self.sc_select_tool = QShortcut(QKeySequence("S"), self)
+        self.sc_select_tool.activated.connect(lambda: self.btn_tool_select.setChecked(True))
+        self.sc_remove_tool = QShortcut(QKeySequence("R"), self)
+        self.sc_remove_tool.activated.connect(lambda: self.btn_tool_remove.setChecked(True))
+        # Cmd+U → Update Count
+        self.update_sc = QShortcut(QKeySequence("Ctrl+U"), self)
+        self.update_sc.activated.connect(self.on_update_count)
         # Drag throttling: avoid drawing too many circles per pixel
         self._last_drag_xy: Optional[Tuple[int, int]] = None
         self._apply_theme_visuals()
+        # Start GPU server connection monitor (Tailscale + SSH ping)
+        self._start_server_monitor()
 
     def _load_gt_counts_csv(self, folder: Optional[Path] = None):
         self.gt_counts_index = {}
@@ -2041,13 +1976,16 @@ class MainWindow(QMainWindow):
 
             gt_text: Optional[str] = None
             diff_text: Optional[str] = None
+            cpsam_diff_text: Optional[str] = None
             if token is not None:
                 label, dilu, x_suffix = token
                 gt_count = self._lookup_gt_count(label, dilu, x_suffix)
                 if gt_count is not None:
                     gt_text = f"GT {label} dilu{dilu}: {gt_count}"
                     if algo_count is not None:
-                        diff_text = f"Diff: {algo_count - gt_count:+d}"
+                        diff_text = f"ColonyNet Diff: {algo_count - gt_count:+d}"
+                    if idx == 0 and row.cpsam_count is not None:
+                        cpsam_diff_text = f"CPSAM Diff: {row.cpsam_count - gt_count:+d}"
 
             algo_text = f"ColonyNet: {algo_count}" if algo_count is not None else None
 
@@ -2060,7 +1998,7 @@ class MainWindow(QMainWindow):
                 if current_count is not None:
                     count_text = f"Current Count: {current_count}"
 
-            if gt_text is not None or cpsam_text is not None or algo_text is not None or diff_text is not None or count_text is not None:
+            if gt_text is not None or cpsam_text is not None or algo_text is not None or diff_text is not None or cpsam_diff_text is not None or count_text is not None:
                 overlays.append(
                     {
                         "position": pos,
@@ -2068,6 +2006,7 @@ class MainWindow(QMainWindow):
                         "cpsam_text": cpsam_text,
                         "algo_text": algo_text,
                         "diff_text": diff_text,
+                        "cpsam_diff_text": cpsam_diff_text,
                         "count_text": count_text,
                     }
                 )
@@ -2077,28 +2016,15 @@ class MainWindow(QMainWindow):
     def _apply_dark_palette(self):
         # This helps on macOS where some widgets ignore stylesheet on first paint.
         p = self.palette()
-        p.setColor(QPalette.Window, QColor(0, 0, 0))
-        p.setColor(QPalette.Base, QColor(0, 0, 0))
-        p.setColor(QPalette.AlternateBase, QColor(5, 5, 5))
-        p.setColor(QPalette.Text, QColor(235, 235, 235))
-        p.setColor(QPalette.WindowText, QColor(235, 235, 235))
-        p.setColor(QPalette.Button, QColor(10, 10, 10))
-        p.setColor(QPalette.ButtonText, QColor(235, 235, 235))
-        p.setColor(QPalette.Highlight, QColor(30, 30, 30))
-        p.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-        self.setPalette(p)
-
-    def _apply_light_palette(self):
-        p = self.palette()
-        p.setColor(QPalette.Window, QColor("#f4f2ee"))
-        p.setColor(QPalette.Base, QColor("#fffdfa"))
-        p.setColor(QPalette.AlternateBase, QColor("#fbf8f2"))
-        p.setColor(QPalette.Text, QColor("#17191e"))
-        p.setColor(QPalette.WindowText, QColor("#17191e"))
-        p.setColor(QPalette.Button, QColor("#f2ede5"))
-        p.setColor(QPalette.ButtonText, QColor("#17191e"))
-        p.setColor(QPalette.Highlight, QColor("#dfe6ea"))
-        p.setColor(QPalette.HighlightedText, QColor("#14171b"))
+        p.setColor(QPalette.Window, QColor(7, 8, 11))          # #07080b
+        p.setColor(QPalette.Base, QColor(10, 12, 17))          # #0a0c11
+        p.setColor(QPalette.AlternateBase, QColor(13, 15, 20)) # #0d0f14
+        p.setColor(QPalette.Text, QColor(231, 234, 240))       # #e7eaf0
+        p.setColor(QPalette.WindowText, QColor(231, 234, 240)) # #e7eaf0
+        p.setColor(QPalette.Button, QColor(11, 13, 18))        # #0b0d12
+        p.setColor(QPalette.ButtonText, QColor(231, 234, 240)) # #e7eaf0
+        p.setColor(QPalette.Highlight, QColor(25, 46, 82))     # #192e52
+        p.setColor(QPalette.HighlightedText, QColor(231, 234, 240))
         self.setPalette(p)
 
     def resizeEvent(self, e):
@@ -2114,15 +2040,21 @@ class MainWindow(QMainWindow):
         self._web_tmp_files.clear()
 
     def _cleanup_web_sessions(self):
-        sessions_dir = Path(__file__).resolve().parent / "web_jobs" / "sessions"
-        if not sessions_dir.exists():
-            return
-        for path in sessions_dir.iterdir():
+        root = Path(__file__).resolve().parent
+        sessions_dir = root / "web_jobs" / "sessions"
+        if sessions_dir.exists():
+            for path in sessions_dir.iterdir():
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        pycache_dir = root / "webui" / "__pycache__"
+        if pycache_dir.exists():
             try:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink(missing_ok=True)
+                shutil.rmtree(pycache_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -2195,33 +2127,46 @@ class MainWindow(QMainWindow):
     def _load_logo(self):
         try:
             base_dir = Path(__file__).resolve().parent
-            if self.theme_mode == "light":
-                candidates = [
-                    base_dir / "Logo.png",
-                    base_dir / "webui" / "static" / "logo.png",
-                    base_dir / "logo.png",
-                    base_dir / "Logo2.png",
-                ]
-            else:
-                candidates = [
-                    base_dir / "Logo2.png",
-                    base_dir / "logo.png",
-                    base_dir / "webui" / "static" / "logo.png",
-                    base_dir / "Logo.jpg",
-                ]
-
+            candidates = [
+                base_dir / "Logo2.png",
+                base_dir / "logo.png",
+                base_dir / "webui" / "static" / "logo.png",
+                base_dir / "Logo.jpg",
+            ]
             for logo_path in candidates:
                 if not logo_path.exists():
                     continue
-                pm = QPixmap(str(logo_path))
-                if pm.isNull():
-                    continue
-                pm = pm.scaledToWidth(260, Qt.SmoothTransformation)
-                self.logo_label.setPixmap(pm)
-                self.logo_label.setToolTip(logo_path.name)
-                return
+                pm = self._load_logo_transparent(logo_path)
+                if pm is not None and not pm.isNull():
+                    pm = pm.scaledToWidth(260, Qt.SmoothTransformation)
+                    self.logo_label.setPixmap(pm)
+                    self.logo_label.setToolTip(logo_path.name)
+                    return
         except Exception:
             pass
+
+    def _load_logo_transparent(self, logo_path: Path) -> "Optional[QPixmap]":
+        """Load a logo and make its dark background transparent (simulates mix-blend-mode: screen)."""
+        try:
+            img = cv2.imread(str(logo_path), cv2.IMREAD_COLOR)
+            if img is None:
+                return None
+            b_ch = img[:, :, 0].astype(np.float32)
+            g_ch = img[:, :, 1].astype(np.float32)
+            r_ch = img[:, :, 2].astype(np.float32)
+            # Weighted luminance — dark pixels become transparent
+            lum = 0.299 * r_ch + 0.587 * g_ch + 0.114 * b_ch
+            alpha = np.clip(lum / 50.0, 0.0, 1.0)
+            rgba = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.uint8)
+            rgba[:, :, 0] = img[:, :, 2]  # R
+            rgba[:, :, 1] = img[:, :, 1]  # G
+            rgba[:, :, 2] = img[:, :, 0]  # B
+            rgba[:, :, 3] = (alpha * 255).astype(np.uint8)
+            h, w = rgba.shape[:2]
+            qimg = QImage(rgba.data, w, h, int(rgba.strides[0]), QImage.Format_RGBA8888)
+            return QPixmap.fromImage(qimg.copy())
+        except Exception:
+            return None
     def _stamp_line(self, mask: np.ndarray, x0: int, y0: int, x1: int, y1: int, radius: int, value: int):
         # Step small enough so strokes are continuous
         dx = x1 - x0
@@ -2253,6 +2198,47 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText("Nothing to undo.")
 
     # ---------- Layout ----------
+    def _build_title_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("TitleBar")
+        bar.setFixedHeight(44)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(10)
+
+        # Connection status dot
+        self.conn_dot_lbl = QLabel("●")
+        self.conn_dot_lbl.setStyleSheet("color: #9aa1ae; font-size: 11px;")
+        self.conn_dot_lbl.setFixedWidth(16)
+
+        # Connection status text
+        self.conn_status_lbl = QLabel("Checking server connection…")
+        self.conn_status_lbl.setObjectName("TitleBarAppName")
+
+        lay.addWidget(self.conn_dot_lbl)
+        lay.addWidget(self.conn_status_lbl)
+
+        lay.addStretch(1)
+
+        # Settings gear
+        btn_settings = QPushButton("⚙  Server Settings")
+        btn_settings.setStyleSheet(_TITLEBAR_BTN_QSS)
+        btn_settings.clicked.connect(self._open_settings_dialog)
+        lay.addWidget(btn_settings)
+
+        return bar
+
+    def _update_title_bar_folder(self, folder_path: Optional[str]):
+        if not hasattr(self, "title_bar_folder_lbl"):
+            return
+        if folder_path:
+            parts = Path(folder_path).parts
+            # Show last 2 path components for brevity
+            crumb = "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+            self.title_bar_folder_lbl.setText(crumb)
+        else:
+            self.title_bar_folder_lbl.setText("No folder loaded")
+
     def _build_left_panel(self) -> QWidget:
         box = QGroupBox("Controls")
         box.setObjectName("ControlsPanel")
@@ -2287,7 +2273,6 @@ class MainWindow(QMainWindow):
         self.logo_label.setMinimumWidth(260)
         self.logo_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.logo_label, 0, Qt.AlignHCenter | Qt.AlignBottom)
-        layout.addWidget(self.btn_theme_toggle, 0, Qt.AlignHCenter)
 
         return box
 
@@ -2323,8 +2308,17 @@ class MainWindow(QMainWindow):
         color_row.setStyleSheet("background: transparent;")
         color_layout = QHBoxLayout(color_row)
         color_layout.setContentsMargins(0, 0, 0, 0)
-        color_layout.addWidget(QLabel("Color:"))
-        color_layout.addWidget(self.color_combo)
+        color_layout.setSpacing(6)
+        lbl_color = QLabel("Color")
+        lbl_color.setStyleSheet("color: #5f6675; font-size: 11px;")
+        color_layout.addWidget(lbl_color)
+        color_layout.addWidget(self.color_combo, 1)
+        # Color swatch — circle showing currently selected color
+        self.color_swatch_lbl = QLabel()
+        self.color_swatch_lbl.setObjectName("ColorSwatch")
+        self.color_swatch_lbl.setFixedSize(14, 14)
+        self._update_color_swatch()
+        color_layout.addWidget(self.color_swatch_lbl)
         layout.addWidget(color_row)
 
         contrast_row = QWidget()
@@ -2337,6 +2331,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(contrast_row)
 
         layout.addSpacing(10)
+        # Count info — wrapped in a styled panel
+        self.count_info_lbl.setObjectName("CountInfoPanel")
         layout.addWidget(self.count_info_lbl)
         layout.addSpacing(6)
         layout.addWidget(self.btn_clear_annotations)
@@ -2347,66 +2343,19 @@ class MainWindow(QMainWindow):
         return self.post_box
 
     def _force_table_dark(self):
-        # Keep method name for compatibility; now applies current theme table style.
         pal = self.table.palette()
-        if self.theme_mode == "light":
-            pal.setColor(QPalette.Base, QColor("#f6f8fa"))
-            pal.setColor(QPalette.Window, QColor("#f6f8fa"))
-            pal.setColor(QPalette.AlternateBase, QColor("#fbf8f2"))
-            pal.setColor(QPalette.Text, QColor("#17191e"))
-            pal.setColor(QPalette.WindowText, QColor("#17191e"))
-            pal.setColor(QPalette.Button, QColor("#f2ede5"))
-            pal.setColor(QPalette.ButtonText, QColor("#17191e"))
-            pal.setColor(QPalette.Highlight, QColor("#f6f8fa"))
-            pal.setColor(QPalette.HighlightedText, QColor("#17191e"))
-            style = """
-                QTableWidget, QTableView, QTableWidget::viewport, QTableView::viewport {
-                    background: #f6f8fa;
-                    color: #17191e;
-                    border: 1px solid #d9e5f0;
-                    gridline-color: #d9e5f0;
-                }
-                QTableWidget::item {
-                    background: #f6f8fa;
-                    color: #17191e;
-                    border-bottom: 1px solid #d9e5f0;
-                }
-                QTableWidget::item:selected { background: #dfe6ea; color: #14171b; }
-                QHeaderView::section {
-                    background: #d9e5f0;
-                    color: #4c4338;
-                    border: 1px solid #d9e5f0;
-                }
-            """
-        else:
-            pal.setColor(QPalette.Base, QColor(0, 0, 0))
-            pal.setColor(QPalette.Window, QColor(0, 0, 0))
-            pal.setColor(QPalette.AlternateBase, QColor(5, 5, 5))
-            pal.setColor(QPalette.Text, QColor(235, 235, 235))
-            pal.setColor(QPalette.WindowText, QColor(235, 235, 235))
-            pal.setColor(QPalette.Button, QColor(0, 0, 0))
-            pal.setColor(QPalette.ButtonText, QColor(235, 235, 235))
-            pal.setColor(QPalette.Highlight, QColor(30, 30, 30))
-            pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-            style = """
-                QTableWidget, QTableView, QTableWidget::viewport, QTableView::viewport {
-                    background: #000000;
-                    color: #eaeaea;
-                    border: 1px solid #111111;
-                    gridline-color: #111111;
-                }
-                QTableWidget::item {
-                    background: #000000;
-                    color: #eaeaea;
-                    border-bottom: 1px solid #111111;
-                }
-                QTableWidget::item:selected { background: #1a1a1a; }
-            """
-
+        pal.setColor(QPalette.Base, QColor(13, 15, 20))          # #0d0f14
+        pal.setColor(QPalette.Window, QColor(13, 15, 20))        # #0d0f14
+        pal.setColor(QPalette.AlternateBase, QColor(10, 12, 17)) # #0a0c11
+        pal.setColor(QPalette.Text, QColor(231, 234, 240))       # #e7eaf0
+        pal.setColor(QPalette.WindowText, QColor(231, 234, 240)) # #e7eaf0
+        pal.setColor(QPalette.Button, QColor(13, 15, 20))        # #0d0f14
+        pal.setColor(QPalette.ButtonText, QColor(231, 234, 240)) # #e7eaf0
+        pal.setColor(QPalette.Highlight, QColor(25, 46, 82))     # #192e52
+        pal.setColor(QPalette.HighlightedText, QColor(231, 234, 240))
         self.table.setPalette(pal)
         self.table.viewport().setPalette(pal)
-
-        self.table.setStyleSheet(style)
+        self.table.setStyleSheet("")  # let global style.qss handle table
 
     def _refresh_widget_style(self, widget: QWidget):
         if widget is None:
@@ -2423,86 +2372,23 @@ class MainWindow(QMainWindow):
         if view is None:
             return
         pal = view.palette()
-        if self.theme_mode == "light":
-            pal.setColor(QPalette.Base, QColor("#fffdfa"))
-            pal.setColor(QPalette.Window, QColor("#fffdfa"))
-            pal.setColor(QPalette.Text, QColor("#17191e"))
-            pal.setColor(QPalette.Highlight, QColor("#dfe6ea"))
-            pal.setColor(QPalette.HighlightedText, QColor("#14171b"))
-            view.setStyleSheet(
-                """
-                QListView, QListView::viewport {
-                    background: #fffdfa;
-                    color: #17191e;
-                    border: none;
-                    outline: 0;
-                    margin: 0;
-                    padding: 0;
-                }
-                QListView::item {
-                    background: #fffdfa;
-                    color: #17191e;
-                    min-height: 22px;
-                }
-                QListView::item:selected {
-                    background: #fffdfa;
-                    color: #17191e;
-                }
-                """
-            )
-        else:
-            pal.setColor(QPalette.Base, QColor("#0b0b0b"))
-            pal.setColor(QPalette.Window, QColor("#0b0b0b"))
-            pal.setColor(QPalette.Text, QColor("#f0f0f0"))
-            pal.setColor(QPalette.Highlight, QColor("#0b0b0b"))
-            pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-            view.setStyleSheet(
-                """
-                QListView, QListView::viewport {
-                    background: #0b0b0b;
-                    color: #f0f0f0;
-                    border: none;
-                    outline: 0;
-                    margin: 0;
-                    padding: 0;
-                }
-                QListView::item {
-                    background: #0b0b0b;
-                    color: #f0f0f0;
-                    min-height: 22px;
-                }
-                QListView::item:selected {
-                    background: #0b0b0b;
-                    color: #ffffff;
-                }
-                """
-            )
+        BG_D = "#0d0f14"
+        pal.setColor(QPalette.Base,            QColor(BG_D))
+        pal.setColor(QPalette.Window,          QColor(BG_D))
+        pal.setColor(QPalette.Text,            QColor("#e7eaf0"))
+        pal.setColor(QPalette.Highlight,       QColor(138, 180, 255, 40))
+        pal.setColor(QPalette.HighlightedText, QColor("#e7eaf0"))
+        view.setStyleSheet("")
         view.setPalette(pal)
         self._refresh_widget_style(view)
 
-    def on_toggle_theme(self):
-        if self.theme_mode == "dark":
-            self.theme_mode = "light"
-        else:
-            self.theme_mode = "dark"
-        self._apply_theme_visuals()
-
     def _apply_theme_visuals(self):
         app = QApplication.instance()
-        if self.theme_mode == "light":
-            self._apply_light_palette()
-            if app is not None:
-                app.setStyleSheet(LIGHT_APP_QSS)
-            self.btn_web_ui_help.setProperty("primary", True)
-            self.btn_theme_toggle.setText("Switch To Dark Mode")
-            self.lbl_or.setStyleSheet("color: #6e6253; padding: 2px 0;")
-        else:
-            self._apply_dark_palette()
-            if app is not None:
-                app.setStyleSheet(self.dark_app_qss)
-            self.btn_web_ui_help.setProperty("primary", False)
-            self.btn_theme_toggle.setText("Switch To Light Mode")
-            self.lbl_or.setStyleSheet("color: #777; padding: 2px 0;")
+        self._apply_dark_palette()
+        if app is not None:
+            app.setStyleSheet(self.dark_app_qss)
+        self.btn_web_ui_help.setProperty("primary", False)
+        self.lbl_or.setStyleSheet("color: #777; padding: 2px 0;")
         self._refresh_widget_style(self.btn_web_ui_help)
         self._load_logo()
         self._force_table_dark()
@@ -2510,6 +2396,257 @@ class MainWindow(QMainWindow):
         row = self._current_row()
         if row is not None and hasattr(self, "count_info_lbl"):
             self._update_count_info_lbl(row)
+
+    # ── Server connection monitor ────────────────────────────────────────────
+
+    def _start_server_monitor(self):
+        """Start background connection polling. Call once after UI is ready."""
+        self._conn_state          = "checking"
+        self._conn_checker_running = False
+        self._tailscale_login_shown = False
+        self._conn_timer = QTimer(self)
+        self._conn_timer.timeout.connect(self._on_conn_check_tick)
+        self._conn_timer.start(6000)               # re-check every 6 s
+        QTimer.singleShot(800, self._on_conn_check_tick)  # first check after 0.8 s
+
+    def _on_conn_check_tick(self):
+        if getattr(self, "_conn_checker_running", False):
+            return  # previous check still running
+        self._conn_checker_running = True
+        _s   = QSettings("CARA", "CPSAMGPUServer")
+        host = _s.value("gpu_host", GPU_HOST_DEFAULT)
+        port = int(_s.value("gpu_port", str(GPU_PORT_DEFAULT)))
+        user = _s.value("gpu_user", GPU_USER_DEFAULT)
+        key  = _s.value("gpu_key",  GPU_KEY_DEFAULT)
+        self._conn_checker_signals = _ConnCheckerSignals()
+        self._conn_checker_signals.result.connect(self._on_conn_result)
+        task = _ConnCheckerTask(host, port, user, key, self._conn_checker_signals)
+        self.thread_pool.start(task)
+
+    def _on_conn_result(self, state: str, detail: str):
+        self._conn_checker_running = False
+        self._update_conn_ui(state, detail)
+
+    _CONN_DOT_COLOR = {
+        "connected":     "#4ade80",   # green
+        "not_logged_in": "#ffd66b",   # amber
+        "server_down":   "#f06060",   # red
+        "no_tailscale":  "#f06060",   # red
+        "checking":      "#9aa1ae",   # gray
+    }
+    _CONN_LABEL = {
+        "connected":     "Connected to GPU server",
+        "not_logged_in": "Tailscale: sign in required",
+        "server_down":   "No server connection",
+        "no_tailscale":  "Tailscale not installed",
+        "checking":      "Checking connection…",
+    }
+
+    def _update_conn_ui(self, state: str, detail: str):
+        """Update title-bar dot + label. Must be called on the main thread."""
+        prev = getattr(self, "_conn_state", None)
+        self._conn_state = state
+
+        color = self._CONN_DOT_COLOR.get(state, "#9aa1ae")
+        label = self._CONN_LABEL.get(state, detail)
+
+        if hasattr(self, "conn_dot_lbl"):
+            self.conn_dot_lbl.setStyleSheet(
+                f"color: {color}; font-size: 11px;")
+        if hasattr(self, "conn_status_lbl"):
+            self.conn_status_lbl.setText(label)
+        # Pulse when newly connected
+        if state == "connected" and prev != "connected":
+            self._pulse_connected_dot()
+
+        # Show Tailscale login dialog once on first detection
+        if state == "not_logged_in" and not getattr(
+                self, "_tailscale_login_shown", False):
+            self._tailscale_login_shown = True
+            QTimer.singleShot(0, self._show_tailscale_login_dialog)
+
+    def _pulse_connected_dot(self):
+        """Brief white→green pulse to celebrate a new connection."""
+        pulses = ["#ffffff", "#4ade80", "#ffffff", "#4ade80", "#ffffff", "#4ade80"]
+        for i, col in enumerate(pulses):
+            QTimer.singleShot(i * 140, lambda c=col: (
+                self.conn_dot_lbl.setStyleSheet(
+                    f"color: {c}; font-size: 11px;")
+                if hasattr(self, "conn_dot_lbl") else None
+            ))
+
+    # ── Tailscale login dialog ───────────────────────────────────────────────
+
+    def _show_tailscale_login_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Tailscale Login Required")
+        dlg.resize(440, 210)
+        dlg.setModal(True)
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "<b>Tailscale is not logged in.</b><br><br>"
+            "Tailscale is needed to reach the GPU server. "
+            "Click <b>Login</b> to open the sign-in page in your browser — "
+            "the app will detect when you have logged in automatically."
+        )
+        info.setWordWrap(True)
+        info.setTextFormat(Qt.RichText)
+        lay.addWidget(info)
+        lay.addStretch(1)
+
+        btn_row = QWidget()
+        blay = QHBoxLayout(btn_row)
+        blay.setContentsMargins(0, 0, 0, 0)
+        btn_login = QPushButton("Open Tailscale Login")
+        btn_login.setProperty("primary", True)
+        btn_skip = QPushButton("Use without GPU")
+        blay.addWidget(btn_login)
+        blay.addStretch(1)
+        blay.addWidget(btn_skip)
+        lay.addWidget(btn_row)
+
+        def _do_login():
+            try:
+                subprocess.Popen(["tailscale", "login"])
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Error",
+                                    f"Could not run 'tailscale login':\n{exc}")
+            dlg.accept()
+
+        btn_login.clicked.connect(_do_login)
+        btn_skip.clicked.connect(dlg.accept)
+        dlg.exec()
+
+    # ── Server settings dialog ───────────────────────────────────────────────
+
+    def _open_settings_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Server Settings")
+        dlg.resize(520, 380)
+        lay = QVBoxLayout(dlg)
+
+        _s = QSettings("CARA", "CPSAMGPUServer")
+
+        fields_def = [
+            ("Host / Tailscale IP", "gpu_host",   GPU_HOST_DEFAULT,
+             "Tailscale IP or hostname of the GPU machine"),
+            ("SSH Port",            "gpu_port",    str(GPU_PORT_DEFAULT),
+             "SSH port — usually 22"),
+            ("Username",            "gpu_user",    GPU_USER_DEFAULT,
+             "Your account name on the GPU machine"),
+            ("SSH Key File",        "gpu_key",     GPU_KEY_DEFAULT,
+             "Local path to SSH private key (e.g. ~/.ssh/gpu_server_key)"),
+            ("CPSAM Root",          "gpu_root",    GPU_CPSAM_ROOT,
+             "Folder containing CPSAM.py on the server"),
+            ("Conda Env",           "gpu_env",     GPU_CONDA_ENV,
+             "Conda environment that has cellpose installed"),
+            ("Script Filename",     "gpu_script",  GPU_CPSAM_SCRIPT,
+             "Name of the CPSAM script file, e.g. CPSAM.py"),
+            ("Model Path",          "gpu_model",   GPU_CPSAM_MODEL,
+             "Absolute path to the finetuned model on the server"),
+        ]
+
+        form = QGridLayout()
+        form.setColumnMinimumWidth(0, 140)
+        edits: Dict[str, QLineEdit] = {}
+        for row_i, (label, key, default, tip) in enumerate(fields_def):
+            lbl = QLabel(label)
+            edit = QLineEdit(_s.value(key, default))
+            edit.setToolTip(tip)
+            form.addWidget(lbl,  row_i, 0)
+            form.addWidget(edit, row_i, 1)
+            edits[key] = edit
+        lay.addLayout(form)
+        lay.addStretch(1)
+
+        note = QLabel(
+            "Changes take effect immediately — the connection check will re-run."
+        )
+        note.setStyleSheet("color: #5f6675; font-size: 11px;")
+        lay.addWidget(note)
+
+        btn_row = QWidget()
+        blay = QHBoxLayout(btn_row)
+        blay.setContentsMargins(0, 4, 0, 0)
+        btn_rekey  = QPushButton("Re-run SSH Setup…")
+        btn_rekey.setToolTip(
+            "Run the one-time setup wizard again (new machine or lost key)")
+        btn_cancel = QPushButton("Cancel")
+        btn_apply  = QPushButton("Apply && Close")
+        btn_apply.setProperty("primary", True)
+        blay.addWidget(btn_rekey)
+        blay.addStretch(1)
+        blay.addWidget(btn_cancel)
+        blay.addWidget(btn_apply)
+        lay.addWidget(btn_row)
+
+        def _apply():
+            for key, edit in edits.items():
+                _s.setValue(key, edit.text().strip())
+            _s.setValue("setup_done", "1")
+            _s.sync()
+            # Trigger an immediate recheck with the new settings
+            self._conn_checker_running = False
+            QTimer.singleShot(200, self._on_conn_check_tick)
+            dlg.accept()
+
+        def _rekey():
+            _s.setValue("setup_done", "")
+            _s.sync()
+            dlg.accept()
+            QTimer.singleShot(0, self._run_ssh_setup_wizard)
+
+        btn_apply.clicked.connect(_apply)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_rekey.clicked.connect(_rekey)
+        dlg.exec()
+
+    def _run_ssh_setup_wizard(self):
+        _s   = QSettings("CARA", "CPSAMGPUServer")
+        host = _s.value("gpu_host", GPU_HOST_DEFAULT)
+        port = int(_s.value("gpu_port", str(GPU_PORT_DEFAULT)))
+        user = _s.value("gpu_user", GPU_USER_DEFAULT)
+        key  = Path(_s.value("gpu_key", GPU_KEY_DEFAULT)).expanduser()
+        wizard = GPUSetupWizard(self, host=host, port=port,
+                                username=user, key_path=key)
+        if wizard.exec() == QDialog.Accepted and wizard.setup_ok:
+            self._conn_checker_running = False
+            QTimer.singleShot(500, self._on_conn_check_tick)
+
+    # ── CPSAM result callbacks (used by simplified on_open_cpsam_dialog) ─────
+
+    def _on_cpsam_done(self, outputs):
+        self.btn_process_cpsam.setEnabled(True)
+        # progress bar: hold at 100 briefly, then reset
+        self.progress.setValue(100)
+        QTimer.singleShot(1200, lambda: self.progress.setValue(0))
+        outs = list(outputs)
+        local_out_dir = getattr(self, "_cpsam_local_out_dir", Path.cwd())
+        image_outs = [o for o in outs if Path(o).suffix.lower() != ".csv"]
+        self.status_lbl.setText(
+            f"CPSAM done — {len(image_outs)} image(s) saved to {local_out_dir}")
+        out_dir_str = str(local_out_dir)
+        if out_dir_str not in self._cpsam_temp_dirs:
+            self._cpsam_temp_dirs.append(out_dir_str)
+        if outs:
+            loaded = self._attach_cpsam_outputs_to_originals(outs)
+            msg = f"CPSAM GPU run finished.\n{len(image_outs)} image(s) processed."
+            if loaded:
+                msg += f"\n{loaded} image(s) matched and shown in the table."
+            QMessageBox.information(self, "GPU CPSAM finished", msg)
+        else:
+            QMessageBox.information(
+                self, "GPU CPSAM finished",
+                "Run completed but no output files were downloaded.\n"
+                "Check the CPSAM script output for errors."
+            )
+
+    def _on_cpsam_error(self, tb: str):
+        self.btn_process_cpsam.setEnabled(True)
+        self.progress.setValue(0)
+        self.status_lbl.setText("GPU CPSAM error — see details.")
+        QMessageBox.critical(self, "GPU CPSAM error", tb)
 
     def _build_right_panel_with_post(self) -> QWidget:
         right_root = QWidget()
@@ -2545,6 +2682,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with images")
         if not folder:
             return
+        self._update_title_bar_folder(folder)
         paths = []
         for p in sorted(Path(folder).glob("*")):
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
@@ -2604,9 +2742,11 @@ class MainWindow(QMainWindow):
         if not paths:
             self.lbl_selected.setText("No images selected.")
             self._load_gt_counts_csv(None)
+            self._update_title_bar_folder(None)
         else:
             self.lbl_selected.setText(f"{len(paths)} image(s) selected.\nFirst: {Path(paths[0]).name}")
             self._load_gt_counts_csv(Path(paths[0]).parent)
+            self._update_title_bar_folder(str(Path(paths[0]).parent))
 
         # NEW: create placeholder ResultRow objects immediately
         self.results = [
@@ -2719,6 +2859,22 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText(f"Processed {len(rows)} image(s).")
         self.table.clearSelection()
 
+    _COLOR_SWATCH_MAP = {
+        "blue":  "#4d9ef6",
+        "pink":  "#f06db0",
+        "red":   "#f06060",
+        "green": "#4ade80",
+        "black": "#555555",
+    }
+
+    def _update_color_swatch(self):
+        if not hasattr(self, "color_swatch_lbl"):
+            return
+        c = self._COLOR_SWATCH_MAP.get(self.paint_color, "#4ade80")
+        self.color_swatch_lbl.setStyleSheet(
+            f"background: {c}; border-radius: 7px; border: 1px solid rgba(255,255,255,30);"
+        )
+
     def on_color_changed(self, txt: str):
         c = txt.strip().lower()
         if c == "pink":
@@ -2731,6 +2887,7 @@ class MainWindow(QMainWindow):
             self.paint_color = "black"
         else:
             self.paint_color = "blue"
+        self._update_color_swatch()
         self.on_table_select()  # redraw preview immediately
 
     def populate_table(self, rows: List[ResultRow]):
@@ -3011,20 +3168,54 @@ class MainWindow(QMainWindow):
             if np.any(m):
                 out[m] = np.array([0, 0, 0], dtype=np.uint8)  # black (RGB)
 
-        # 4) larger selection counts (numbers)
+        # 4) Coin-style selection labels — amber circle, black border, dark centred number
+        #    NOTE: `out` is an RGB array (cv_read_rgb), so color tuples are (R, G, B)
         for lab in pp.labels:
             x, y, n = int(lab.x), int(lab.y), int(lab.n)
-            cv2.circle(out, (x, y), 12, (255, 255, 0), -1)
-            cv2.putText(
-                out,
-                str(n),
-                (x + 20, y - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                2.1,
-                (255, 255, 0),
-                6,
-                cv2.LINE_AA,
-            )
+            r_coin = 26
+            amber  = (255, 214, 107)   # #ffd66b
+            dark   = (26,  18,   2)    # #1a1202
+
+            # Soft gaussian glow (box-shadow: 0 0 12px rgba(255,214,107,0.6))
+            glow = np.zeros_like(out)
+            cv2.circle(glow, (x, y), r_coin + 10, amber, -1)
+            glow = cv2.GaussianBlur(glow, (0, 0), 9)
+            out  = cv2.addWeighted(out, 1.0, glow, 0.60, 0)
+
+            # Amber fill + hairline ring (box-shadow: 0 0 0 1.5px #000)
+            cv2.circle(out, (x, y), r_coin, amber, -1)
+            cv2.circle(out, (x, y), r_coin, (0, 0, 0), 2)
+
+            # Bold number via PIL — system font (SF Pro / Helvetica Neue Bold)
+            try:
+                from PIL import Image as _PIm, ImageDraw as _PDr, ImageFont as _PFnt
+                _fsize = r_coin + 4   # fill ~75% of the coin diameter
+                if not hasattr(self, "_coin_font") or getattr(self, "_coin_font_sz", 0) != _fsize:
+                    self._coin_font_sz = _fsize
+                    self._coin_font = None
+                    for _fp, _idx in [
+                        ("/System/Library/Fonts/HelveticaNeue.ttc", 4),   # Black
+                        ("/System/Library/Fonts/HelveticaNeue.ttc", 2),   # Bold fallback
+                        ("/Library/Fonts/Arial Bold.ttf", 0),
+                        ("/System/Library/Fonts/Helvetica.ttc", 0),
+                        ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 0),
+                        ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
+                    ]:
+                        try:
+                            self._coin_font = _PFnt.truetype(_fp, _fsize, index=_idx)
+                            break
+                        except Exception:
+                            pass
+                _pil = _PIm.fromarray(out)
+                _PDr.Draw(_pil).text((x, y), str(n), font=self._coin_font,
+                                     fill=(dark[0], dark[1], dark[2]), anchor="mm")
+                out = np.array(_pil)
+            except Exception:
+                fs, fw = 0.70, 2
+                _txt = str(n)
+                (tw, th), _ = cv2.getTextSize(_txt, cv2.FONT_HERSHEY_SIMPLEX, fs, fw)
+                cv2.putText(out, _txt, (x - tw // 2, y + th // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, fs, dark, fw, cv2.LINE_AA)
 
         return out
 
@@ -3090,37 +3281,93 @@ class MainWindow(QMainWindow):
         overlays = self._get_count_overlays_for_row(row, current_count=row.current_count)
         if not overlays:
             self.count_info_lbl.setText("")
+            if hasattr(self, "preview_label"):
+                self.preview_label.set_count_overlay([])
             return
-        is_dark = getattr(self, "theme_mode", "dark") != "light"
+
+        is_dark = True
         if is_dark:
-            bg = "#000000"
-            gt_col = "#ffff00"
-            algo_col = "#00ee00"
-            diff_col = "#ff5555"
-            count_col = "#00c8ff"
+            dim_col   = "#9aa1ae"   # text-dim  — labels
+            count_col = "#ffd66b"   # amber     — current count value
+            algo_col  = "#e7eaf0"   # text      — ColonyNet
+            cpsam_col = "#9aa1ae"   # text-dim  — CPSAM
+            gt_col    = "#9aa1ae"   # text-dim  — GT
+            diff_neg  = "#ff8585"   # danger
+            diff_pos  = "#8ce6a4"   # success
         else:
-            bg = "#ffffff"
-            gt_col = "#8a7000"
-            algo_col = "#006600"
-            diff_col = "#cc0000"
+            dim_col   = "#555555"
             count_col = "#0060aa"
+            algo_col  = "#006600"
+            cpsam_col = "#004488"
+            gt_col    = "#8a7000"
+            diff_neg  = "#cc0000"
+            diff_pos  = "#007700"
+
         parts = []
+        canvas_lines = []  # (text, color_hex, is_big)
+
         for ov in overlays:
-            if ov.get("gt_text"):
-                parts.append(f'<span style="color:{gt_col};">{ov["gt_text"]}</span>')
-            if ov.get("cpsam_text"):
-                parts.append(f'<span style="color:{count_col};">{ov["cpsam_text"]}</span>')
+            # Current Count — big amber number on canvas, styled row in panel
+            if ov.get("count_text"):
+                raw = ov["count_text"]          # e.g. "Current Count: 142"
+                try:
+                    n_str = raw.split(":")[-1].strip()
+                    canvas_lines.append((f"{n_str} colonies", "#ffd66b", True))
+                except Exception:
+                    canvas_lines.append((raw, "#ffd66b", True))
+                try:
+                    n_str = raw.split(":")[-1].strip()
+                except Exception:
+                    n_str = raw
+                parts.append(
+                    f'<span style="color:{dim_col};">Current Count: </span>'
+                    f'<b style="color:{count_col};">{n_str}</b>'
+                )
+
+            # ColonyNet algo count
             if ov.get("algo_text"):
                 parts.append(f'<span style="color:{algo_col};">{ov["algo_text"]}</span>')
+                canvas_lines.append((ov["algo_text"], "#e7eaf0", False))
+
+            # CPSAM count
+            if ov.get("cpsam_text"):
+                parts.append(f'<span style="color:{cpsam_col};">{ov["cpsam_text"]}</span>')
+                canvas_lines.append((ov["cpsam_text"], "#9aa1ae", False))
+
+            # CPSAM diff vs GT
+            if ov.get("cpsam_diff_text"):
+                raw_cdiff = ov["cpsam_diff_text"]
+                try:
+                    cdiff_val = int(raw_cdiff.split(":")[-1].strip().replace("−", "-"))
+                    cdc = diff_pos if cdiff_val >= 0 else diff_neg
+                except Exception:
+                    cdc = diff_neg
+                parts.append(f'<span style="color:{cdc};">{raw_cdiff}</span>')
+                canvas_lines.append((raw_cdiff, cdc, False))
+
+            # Ground truth
+            if ov.get("gt_text"):
+                parts.append(f'<span style="color:{gt_col};">{ov["gt_text"]}</span>')
+                canvas_lines.append((ov["gt_text"], "#9aa1ae", False))
+
+            # Diff — colour depends on sign
             if ov.get("diff_text"):
-                parts.append(f'<span style="color:{diff_col};">{ov["diff_text"]}</span>')
-            if ov.get("count_text"):
-                parts.append(f'<span style="color:{algo_col};">{ov["count_text"]}</span>')
+                raw_diff = ov["diff_text"]
+                try:
+                    diff_val = int(raw_diff.split(":")[-1].strip().replace("−", "-"))
+                    dc = diff_pos if diff_val >= 0 else diff_neg
+                except Exception:
+                    dc = diff_neg
+                parts.append(f'<span style="color:{dc};">{raw_diff}</span>')
+                canvas_lines.append((raw_diff, dc, False))
+
         html = "<br>".join(parts)
-        self.count_info_lbl.setText(
-            f'<div style="background:{bg};padding:6px;border-radius:4px;'
-            f'font-size:13pt;font-weight:bold;">{html}</div>'
-        )
+        font_style = "font-family:'Geist Mono','SF Mono','Fira Mono',monospace;font-size:11pt;line-height:1.8;"
+        self.count_info_lbl.setText(f'<div style="{font_style}">{html}</div>')
+
+        # Push to canvas overlay
+        if hasattr(self, "preview_label"):
+            self.preview_label.set_count_overlay(canvas_lines)
 
     def on_table_select(self):
         row = self._current_row()
@@ -3282,7 +3529,17 @@ class MainWindow(QMainWindow):
                 pp.labels.append(AnnotationLabel(pp.next_label, x, y))
                 pp.next_label += 1
 
-        self.on_table_select()
+        if self.active_tool in ("paint", "remove"):
+            # Throttle ALL paint/remove redraws (click + drag) through the timer.
+            # This prevents the initial click from blocking the event loop and
+            # ensures panning (which emits drag_end but never sets this flag)
+            # does not trigger unnecessary renders.
+            self._was_paint_drag = True
+            if not self._paint_redraw_pending:
+                self._paint_redraw_pending = True
+                self._paint_redraw_timer.start()
+        else:
+            self.on_table_select()
 
     def on_preview_clicked_once(self, x: int, y: int):
         self._last_drag_xy = None
@@ -3294,9 +3551,20 @@ class MainWindow(QMainWindow):
         if self.active_tool in ("paint", "remove"):
             self._apply_tool_at(x, y, is_drag=True)
 
+    def _flush_paint_redraw(self):
+        self._paint_redraw_pending = False
+        self.on_table_select()
+
     def on_preview_drag_end(self):
         self._last_drag_xy = None
         self._last_paint_xy = None
+        self._paint_redraw_timer.stop()
+        self._paint_redraw_pending = False
+        # Only flush if we were actually painting — panning emits drag_end too
+        # and calling on_table_select() there just creates a render backlog.
+        if getattr(self, "_was_paint_drag", False):
+            self._was_paint_drag = False
+            self.on_table_select()
 
     def on_clear_annotations(self):
         row = self._current_row()
@@ -3515,215 +3783,82 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No input", "Select/check images first.")
             return
 
-        # ── Auto-trigger first-time setup wizard if needed ────────────────────
-        _s = QSettings("CARA", "CPSAMGPUServer")
-        _setup_done  = _s.value("setup_done", "") == "1"
-        _saved_host  = _s.value("gpu_host",  GPU_HOST_DEFAULT)
-        _saved_user  = _s.value("gpu_user",  GPU_USER_DEFAULT)
-        _saved_key   = Path(_s.value("gpu_key", GPU_KEY_DEFAULT)).expanduser()
-        _saved_port  = int(_s.value("gpu_port", str(GPU_PORT_DEFAULT)))
+        # ── Guard: warn if server not connected ───────────────────────────────
+        state = getattr(self, "_conn_state", "checking")
+        if state != "connected":
+            if state == "not_logged_in":
+                msg = ("Tailscale is not logged in.\n\n"
+                       "Sign in to Tailscale first, then try again.")
+            elif state == "no_tailscale":
+                msg = ("Tailscale is not installed.\n\n"
+                       "Download Tailscale from tailscale.com and log in.")
+            else:
+                msg = ("The GPU server is not reachable right now.\n\n"
+                       "Check that Tailscale is running and the server is on, "
+                       "or open Server Settings to verify the connection details.")
+            mb = QMessageBox(self)
+            mb.setWindowTitle("No Server Connection")
+            mb.setText(msg)
+            mb.setIcon(QMessageBox.Warning)
+            mb.addButton("Cancel", QMessageBox.RejectRole)
+            btn_open_settings = mb.addButton("Open Settings", QMessageBox.ActionRole)
+            mb.exec()
+            if mb.clickedButton() is btn_open_settings:
+                self._open_settings_dialog()
+            return
 
+        # ── Auto-trigger first-time SSH key setup if needed ───────────────────
+        _s = QSettings("CARA", "CPSAMGPUServer")
+        _setup_done = _s.value("setup_done", "") == "1"
+        _saved_key  = Path(_s.value("gpu_key", GPU_KEY_DEFAULT)).expanduser()
         if not _setup_done or not _saved_key.exists():
-            wizard = GPUSetupWizard(
-                self,
-                host=_saved_host,
-                port=_saved_port,
-                username=_saved_user,
-                key_path=_saved_key,
-            )
-            wizard.exec()
-            if not wizard.setup_ok:
-                return   # user cancelled or setup failed — don't open main dialog
-            _s.sync()   # reload settings saved by wizard
-
-        # ── Main GPU server dialog ────────────────────────────────────────────
-        out_base = self._csv_path()
-        if out_base is None:
-            local_out_dir = Path.cwd() / "cpsam_out"
-        else:
-            local_out_dir = out_base.parent / "cpsam_out"
-        local_out_dir.mkdir(parents=True, exist_ok=True)
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("CPSAM — GPU Server")
-        dlg.resize(820, 600)
-        lay = QVBoxLayout(dlg)
-
-        # QSettings already loaded above; re-read in case wizard updated them
-        _s = QSettings("CARA", "CPSAMGPUServer")
-
-        form2 = QGridLayout()
-        form2.setColumnMinimumWidth(0, 110)
-
-        gpu_host_edit   = QLineEdit(_s.value("gpu_host",   GPU_HOST_DEFAULT))
-        gpu_port_edit   = QLineEdit(_s.value("gpu_port",   str(GPU_PORT_DEFAULT)))
-        gpu_user_edit   = QLineEdit(_s.value("gpu_user",   GPU_USER_DEFAULT))
-        gpu_key_edit    = QLineEdit(_s.value("gpu_key",    GPU_KEY_DEFAULT))
-        gpu_root_edit   = QLineEdit(_s.value("gpu_root",   GPU_CPSAM_ROOT))
-        gpu_env_edit    = QLineEdit(_s.value("gpu_env",    GPU_CONDA_ENV))
-        gpu_script_edit = QLineEdit(_s.value("gpu_script", GPU_CPSAM_SCRIPT))
-        gpu_model_edit  = QLineEdit(_s.value("gpu_model",  GPU_CPSAM_MODEL))
-
-        fields = [
-            ("Host / Tailscale IP", gpu_host_edit,
-             "IP or hostname of the GPU machine (e.g. 100.126.92.100)"),
-            ("Port",                gpu_port_edit,   "SSH port — usually 22"),
-            ("Username",            gpu_user_edit,   "Your account name on the GPU machine"),
-            ("SSH key file",        gpu_key_edit,
-             "Local private key path — e.g. ~/.ssh/gpu_server_key"),
-            ("CPSAM root",          gpu_root_edit,
-             "Folder containing CPSAM.py on the GPU machine"),
-            ("Conda env",           gpu_env_edit,    "Conda environment that has cellpose"),
-            ("Script filename",     gpu_script_edit, "Name of the CPSAM script, e.g. CPSAM.py"),
-            ("Model path",          gpu_model_edit,
-             "Path to the finetuned model (relative to CPSAM root or absolute)"),
-        ]
-        for row_i, (label, widget, tip) in enumerate(fields):
-            lbl = QLabel(label)
-            widget.setToolTip(tip)
-            form2.addWidget(lbl,    row_i, 0)
-            form2.addWidget(widget, row_i, 1)
-
-        lay.addLayout(form2)
-
-
-        gpu_status_lbl = QLabel("Ready.")
-        gpu_status_lbl.setWordWrap(True)
-        lay.addWidget(gpu_status_lbl)
-
-        btn_row2 = QWidget()
-        blay2 = QHBoxLayout(btn_row2)
-        blay2.setContentsMargins(0, 0, 0, 0)
-        btn_gpu_run = QPushButton("Run on GPU Server")
-        btn_gpu_run.setProperty("primary", True)
-        blay2.addWidget(btn_gpu_run)
-        blay2.addStretch(1)
-        lay.addWidget(btn_row2)
-
-        lay.addStretch(1)
-
-        # ── Bottom row: reset setup + close ──────────────────────────────────
-        btn_close_row = QWidget()
-        blay_close = QHBoxLayout(btn_close_row)
-        blay_close.setContentsMargins(0, 4, 0, 0)
-        btn_reset = QPushButton("Re-run Setup…")
-        btn_reset.setToolTip("Run the setup wizard again (e.g. new machine or new password)")
-        btn_close = QPushButton("Close")
-        blay_close.addWidget(btn_reset)
-        blay_close.addStretch(1)
-        blay_close.addWidget(btn_close)
-        lay.addWidget(btn_close_row)
-
-        btn_close.clicked.connect(dlg.accept)
-
-        def _rerun_setup():
-            _s.setValue("setup_done", "")
+            self._run_ssh_setup_wizard()
+            # Re-read after wizard; if key still missing, bail
             _s.sync()
-            dlg.accept()
-            # Defer the reopen so the current dialog fully tears down first,
-            # preventing re-entrant Qt event handling that causes SIGSEGV.
-            QTimer.singleShot(0, self.on_open_cpsam_dialog)
-
-        btn_reset.clicked.connect(_rerun_setup)
-
-        # ── GPU run logic ─────────────────────────────────────────────────────
-
-        def _save_gpu_settings():
-            _s.setValue("gpu_host",   gpu_host_edit.text().strip())
-            _s.setValue("gpu_port",   gpu_port_edit.text().strip())
-            _s.setValue("gpu_user",   gpu_user_edit.text().strip())
-            _s.setValue("gpu_key",    gpu_key_edit.text().strip())
-            _s.setValue("gpu_root",   gpu_root_edit.text().strip())
-            _s.setValue("gpu_env",    gpu_env_edit.text().strip())
-            _s.setValue("gpu_script", gpu_script_edit.text().strip())
-            _s.setValue("gpu_model",  gpu_model_edit.text().strip())
-
-        def _on_gpu_run():
-            host   = gpu_host_edit.text().strip()
-            user   = gpu_user_edit.text().strip()
-            key    = gpu_key_edit.text().strip() or GPU_KEY_DEFAULT
-            root   = gpu_root_edit.text().strip()
-            script = gpu_script_edit.text().strip()
-            model  = gpu_model_edit.text().strip()
-            env    = gpu_env_edit.text().strip() or GPU_CONDA_ENV
-            try:
-                port = int(gpu_port_edit.text().strip() or "22")
-            except ValueError:
-                port = 22
-
-            missing = [n for n, v in [("Host / IP", host), ("Username", user),
-                                       ("CPSAM root", root), ("Script filename", script)]
-                       if not v]
-            if missing:
-                QMessageBox.warning(
-                    dlg, "Missing fields",
-                    "Please fill in: " + ", ".join(missing)
-                )
+            _saved_key = Path(_s.value("gpu_key", GPU_KEY_DEFAULT)).expanduser()
+            if not _saved_key.exists():
                 return
 
-            _save_gpu_settings()
-            btn_gpu_run.setEnabled(False)
-            gpu_status_lbl.setText("Connecting ...")
+        # ── Run directly using saved settings ─────────────────────────────────
+        _s   = QSettings("CARA", "CPSAMGPUServer")
+        host = _s.value("gpu_host",   GPU_HOST_DEFAULT)
+        port = int(_s.value("gpu_port", str(GPU_PORT_DEFAULT)))
+        user = _s.value("gpu_user",   GPU_USER_DEFAULT)
+        key  = _s.value("gpu_key",    GPU_KEY_DEFAULT)
+        root = _s.value("gpu_root",   GPU_CPSAM_ROOT)
+        env  = _s.value("gpu_env",    GPU_CONDA_ENV)
+        script = _s.value("gpu_script", GPU_CPSAM_SCRIPT)
+        model  = _s.value("gpu_model",  GPU_CPSAM_MODEL)
 
-            # Store signals on self (main-thread object) — NOT as a local
-            # variable.  A local dies when _on_gpu_run() returns, leaving
-            # task.signals as the sole reference.  The thread pool then destroys
-            # it on the background thread → SIGSEGV.  Keeping it on self
-            # guarantees it outlives the runnable's background-thread teardown.
-            self._cpsam_signals = SSHJobSignals()
-            task = DirectSSHCPSAMTask(
-                image_paths=image_paths,
-                local_out_dir=local_out_dir,
-                host=host,
-                port=port,
-                username=user,
-                key_file=key,
-                remote_root=root,
-                conda_env=env,
-                cpsam_script=script,
-                cpsam_model=model,
-                signals=self._cpsam_signals,
-                cleanup_remote=True,
-            )
-            self._cpsam_signals.status.connect(gpu_status_lbl.setText)
-            self._cpsam_signals.status.connect(self.status_lbl.setText)
-            self._cpsam_signals.finished.connect(_on_gpu_done)
-            self._cpsam_signals.error.connect(_on_gpu_error)
-            self.thread_pool.start(task)
+        out_base = self._csv_path()
+        self._cpsam_local_out_dir = (
+            out_base.parent / "cpsam_out" if out_base else Path.cwd() / "cpsam_out"
+        )
+        self._cpsam_local_out_dir.mkdir(parents=True, exist_ok=True)
 
-        def _on_gpu_done(outputs):
-            btn_gpu_run.setEnabled(True)
-            outs = list(outputs)
-            gpu_status_lbl.setText(
-                f"Done — {len(outs)} file(s) saved to {local_out_dir}"
-            )
-            self.status_lbl.setText(gpu_status_lbl.text())
-            # Register the output directory for cleanup on close.
-            out_dir_str = str(local_out_dir)
-            if out_dir_str not in self._cpsam_temp_dirs:
-                self._cpsam_temp_dirs.append(out_dir_str)
-            if outs:
-                loaded = self._attach_cpsam_outputs_to_originals(outs)
-                msg = f"CPSAM GPU run finished.\n{len(outs)} file(s) downloaded."
-                if loaded:
-                    msg += f"\n{loaded} image(s) matched and shown in the table."
-                QMessageBox.information(dlg, "GPU CPSAM finished", msg)
-            else:
-                QMessageBox.information(
-                    dlg, "GPU CPSAM finished",
-                    "Run completed but no output files were downloaded.\n"
-                    "Check the CPSAM script output for errors."
-                )
+        self.status_lbl.setText(
+            f"CPSAM: uploading {len(image_paths)} image(s) to GPU server…")
+        self.btn_process_cpsam.setEnabled(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
 
-        def _on_gpu_error(tb: str):
-            btn_gpu_run.setEnabled(True)
-            gpu_status_lbl.setText("Error — see details.")
-            self.status_lbl.setText("GPU CPSAM error.")
-            QMessageBox.critical(dlg, "GPU CPSAM error", tb)
-
-        btn_gpu_run.clicked.connect(_on_gpu_run)
-
-        dlg.exec()
+        # Keep signals on self so they outlive this method's stack frame
+        # (same SIGSEGV-prevention pattern as before).
+        self._cpsam_signals = SSHJobSignals()
+        task = DirectSSHCPSAMTask(
+            image_paths=image_paths,
+            local_out_dir=self._cpsam_local_out_dir,
+            host=host, port=port, username=user, key_file=key,
+            remote_root=root, conda_env=env,
+            cpsam_script=script, cpsam_model=model,
+            signals=self._cpsam_signals,
+            cleanup_remote=True,
+        )
+        self._cpsam_signals.status.connect(self.status_lbl.setText)
+        self._cpsam_signals.progress.connect(self.progress.setValue)
+        self._cpsam_signals.finished.connect(self._on_cpsam_done)
+        self._cpsam_signals.error.connect(self._on_cpsam_error)
+        self.thread_pool.start(task)
 
     def _attach_cpsam_outputs_to_originals(self, output_paths: List[str]) -> int:
         if not self.results:
@@ -3796,10 +3931,13 @@ class MainWindow(QMainWindow):
 
             row._masked_cache = None
             row.masked_green_initialized = False   # re-extract green/yellow from new overlay
-            row.current_count = None               # will be auto-computed on next select
-            # Attach count from CPSAM CSV if available for this source image.
+            # Use CSV count directly as current_count so it matches CPSAM's own tally.
+            # Fall back to pixel-recompute only when no CSV count is available.
             if src_stem in cpsam_counts:
                 row.cpsam_count = cpsam_counts[src_stem]
+                row.current_count = cpsam_counts[src_stem]
+            else:
+                row.current_count = None           # will be auto-computed on next select
             self._update_table_row(i, row)
 
         if matched_rows > 0:
@@ -3862,10 +4000,10 @@ class MainWindow(QMainWindow):
                         import tempfile as _tempfile
                         h, w = r.pp_masked.paint_mask_yellow.shape[:2]
                         overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
-                        ym = r.pp_masked.paint_mask_yellow > 0
-                        overlay_rgb[ym] = [255, 255, 0]
                         gm = r.pp_masked.paint_mask_green > 0
                         overlay_rgb[gm] = [0, 255, 0]
+                        ym = r.pp_masked.paint_mask_yellow > 0
+                        overlay_rgb[ym] = [255, 255, 0]
                         tmp_overlay = Path(_tempfile.gettempdir()) / f"{Path(r.source_image).stem}_web_overlay.png"
                         cv2.imwrite(str(tmp_overlay), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
                         self._web_tmp_files.add(str(tmp_overlay))
@@ -3873,6 +4011,11 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
+            _tokens = self._parse_label_dilu_tokens(src)
+            _gt_count = None
+            if _tokens:
+                _label, _dilu, _x_suffix = _tokens[0]
+                _gt_count = self._lookup_gt_count(_label, _dilu, _x_suffix)
             rows.append(
                 {
                     "image": Path(src).name,
@@ -3880,6 +4023,10 @@ class MainWindow(QMainWindow):
                     "tif_paths": base_tifs,
                     "expt_paths": base_expts,
                     "post_mask_paths": base_post_masks,
+                    "algo_count": r.algorithm_counts[0] if r.algorithm_counts else None,
+                    "cpsam_count": r.cpsam_count,
+                    "current_count": r.current_count,
+                    "gt_count": _gt_count,
                 }
             )
         if not rows:

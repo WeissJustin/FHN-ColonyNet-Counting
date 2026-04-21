@@ -101,9 +101,8 @@ More information and graphics of the setup in the Report that can be found above
 ---
  
 ## Demo
- 
-> 🎥 *Demo video coming soon — will show full pipeline from raw image to colony count overlay.*
- 
+
+![til](https://raw.githubusercontent.com/WeissJustin/FHN-ColonyNet-Counting/Extras/animation.gif)
 ---
  
 ## Acknowledgments

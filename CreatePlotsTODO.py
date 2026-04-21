@@ -28,6 +28,7 @@ Outputs (in out_dir):
   dashboard_regression_trimmed.png — regression + overlay, without 20 biggest errors
   dashboard_bland_altman.png— Bland–Altman plots
   dashboard_bland_altman_trimmed.png — Bland–Altman plots, without 20 biggest errors
+  dashboard_error_by_count_range.png — CPSAM error box plot across predicted-count ranges
   dashboard_sizes.png       — size distribution plots (train mode only)
   dashboard_size_analysis.png — advanced size analysis (train mode only)
   summary.txt               — console summary saved to file
@@ -49,15 +50,66 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+FIG_DPI = 300
+MAX_ABS_ERROR_FOR_PLOTS = 300.0
+JOURNAL_COLORS = {
+    "cpsam": "#163f6b",
+    "algo1": "#7a1f1f",
+    "algo2": "#4f5d2f",
+    "GT": "#111111",
+    "CPSAM": "#163f6b",
+    "KC Algorithm": "#7a1f1f",
+    "FHN ColonyNet": "#4f5d2f",
+}
+STAT_BBOX = dict(boxstyle="round,pad=0.28", fc="white", ec="#3f3f3f", lw=0.9, alpha=0.96)
+
 matplotlib.rcParams.update({
-    "font.size": 11,
-    "axes.titlesize": 13,
-    "axes.labelsize": 11,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
-    "legend.fontsize": 9,
-    "figure.titlesize": 16,
+    "font.family": "DejaVu Serif",
+    "font.size": 12,
+    "font.weight": "bold",
+    "axes.titlesize": 15,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 13,
+    "axes.labelweight": "bold",
+    "axes.linewidth": 1.4,
+    "axes.facecolor": "white",
+    "figure.facecolor": "white",
+    "savefig.facecolor": "white",
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "xtick.major.width": 1.2,
+    "ytick.major.width": 1.2,
+    "xtick.major.size": 5.5,
+    "ytick.major.size": 5.5,
+    "legend.fontsize": 10,
+    "legend.frameon": False,
+    "figure.titlesize": 18,
+    "figure.titleweight": "bold",
+    "grid.color": "#d7d7d7",
+    "grid.linewidth": 0.8,
+    "grid.linestyle": "-",
+    "axes.grid": False,
+    "mathtext.fontset": "dejavuserif",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
 })
+
+
+def style_axes(ax, grid_axis: str = "y"):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(1.4)
+    ax.spines["bottom"].set_linewidth(1.4)
+    ax.tick_params(axis="both", which="major", width=1.2, length=5.5)
+    for tick_label in ax.get_xticklabels() + ax.get_yticklabels():
+        tick_label.set_fontweight("bold")
+    if grid_axis:
+        ax.grid(axis=grid_axis, color="#d7d7d7", linewidth=0.8, alpha=0.9)
+    ax.set_axisbelow(True)
+
+
+def save_figure(fig: plt.Figure, out_path: Path):
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight")
 
 # =============================================================================
 # Utilities
@@ -298,21 +350,23 @@ def build_matched_table(
 def plot_count_comparison_hist(ax, pred: np.ndarray, gt: np.ndarray, label: str,
                                 color: str, bins: int = 40):
     diffs = gt - pred
-    valid = np.isfinite(diffs)
+    valid = np.isfinite(diffs) & (np.abs(diffs) <= MAX_ABS_ERROR_FOR_PLOTS)
     diffs = diffs[valid]
     if diffs.size == 0:
         ax.text(0.5, 0.5, f"{label}\nNo data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
-    ax.hist(diffs, bins=bins, color=color, alpha=0.75, edgecolor="white", linewidth=0.5)
-    ax.axvline(0, linestyle="--", linewidth=1.2, color="black")
+    ax.hist(diffs, bins=bins, color=color, alpha=0.9, edgecolor="#ffffff", linewidth=0.9)
+    ax.axvline(0, linestyle="--", linewidth=1.5, color="#111111")
     mae = float(np.mean(np.abs(diffs)))
     mean_d = float(np.mean(diffs))
-    ax.set_title(f"GT − {label}")
+    ax.set_title(f"GT - {label}")
     ax.set_xlabel("GT − Pred")
     ax.set_ylabel("Number of dishes")
     ax.text(0.98, 0.95, f"MAE={mae:.1f}\nBias={mean_d:.1f}\nn={diffs.size}",
             transform=ax.transAxes, ha="right", va="top", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+            fontweight="bold", bbox=STAT_BBOX)
+    style_axes(ax, grid_axis="y")
 
 
 # =============================================================================
@@ -326,9 +380,11 @@ def plot_scatter_regression(ax, pred: np.ndarray, gt: np.ndarray, label: str,
     if pred_v.size < 2:
         ax.text(0.5, 0.5, f"{label}\nInsufficient data", ha="center", va="center",
                 transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return np.nan, np.nan, np.nan
 
-    ax.scatter(pred_v, gt_v, s=18, alpha=0.7, color=color, zorder=3)
+    ax.scatter(pred_v, gt_v, s=32, alpha=0.82, color=color,
+               edgecolors="white", linewidths=0.5, zorder=3)
 
     lo = float(min(pred_v.min(), gt_v.min()))
     hi = float(max(pred_v.max(), gt_v.max()))
@@ -337,14 +393,14 @@ def plot_scatter_regression(ax, pred: np.ndarray, gt: np.ndarray, label: str,
     hi += pad
 
     # y = x
-    ax.plot([lo, hi], [lo, hi], "--", linewidth=1, color="gray", label="y = x")
+    ax.plot([lo, hi], [lo, hi], "--", linewidth=1.5, color="#444444", label="y = x")
 
     # regression
     slope, intercept, r2 = linregress_np(pred_v, gt_v)
     if np.isfinite(slope):
         xs = np.linspace(lo, hi, 200)
-        ax.plot(xs, slope * xs + intercept, linewidth=1.5, color=color,
-                label=f"{label}: y={slope:.2f}x+{intercept:.1f}")
+        ax.plot(xs, slope * xs + intercept, linewidth=2.3, color=color,
+                label=f"{label}: y={slope:.2f}x + {intercept:.1f}")
 
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
@@ -355,8 +411,10 @@ def plot_scatter_regression(ax, pred: np.ndarray, gt: np.ndarray, label: str,
     if show_stats:
         mae = float(np.mean(np.abs(gt_v - pred_v)))
         ax.text(0.02, 0.95, f"n={pred_v.size}\nMAE={mae:.1f}\nR²={r2:.3f}",
-                transform=ax.transAxes, ha="left", va="top", fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+                transform=ax.transAxes, ha="left", va="top", fontsize=10,
+                fontweight="bold", bbox=STAT_BBOX)
+
+    style_axes(ax, grid_axis="both")
 
     return slope, intercept, r2
 
@@ -379,13 +437,13 @@ def plot_regression_overlay(ax, matched: pd.DataFrame, sources: dict[str, str]):
         lo_global = min(lo_global, pv.min(), gv.min())
         hi_global = max(hi_global, pv.max(), gv.max())
 
-        ax.scatter(pv, gv, s=12, alpha=0.35, color=color, zorder=2)
+        ax.scatter(pv, gv, s=24, alpha=0.2, color=color, edgecolors="none", zorder=2)
 
         slope, intercept, r2 = linregress_np(pv, gv)
         if np.isfinite(slope):
             xs = np.linspace(pv.min(), pv.max(), 200)
             label_name = col.upper() if col != "cpsam" else "CPSAM"
-            ax.plot(xs, slope * xs + intercept, linewidth=2, color=color,
+            ax.plot(xs, slope * xs + intercept, linewidth=2.5, color=color,
                     label=f"{label_name}: R²={r2:.3f}", zorder=4)
 
     if np.isfinite(lo_global) and np.isfinite(hi_global):
@@ -393,14 +451,15 @@ def plot_regression_overlay(ax, matched: pd.DataFrame, sources: dict[str, str]):
         lo_global -= pad
         hi_global += pad
         ax.plot([lo_global, hi_global], [lo_global, hi_global], "--",
-                linewidth=1, color="gray", label="y = x", zorder=1)
+                linewidth=1.6, color="#444444", label="y = x", zorder=1)
         ax.set_xlim(lo_global, hi_global)
         ax.set_ylim(lo_global, hi_global)
 
     ax.set_xlabel("Predicted count")
     ax.set_ylabel("GT count")
     ax.set_title("Regression Overlay: All Methods vs GT")
-    ax.legend(loc="upper left", fontsize=9, frameon=True)
+    ax.legend(loc="upper left", fontsize=10)
+    style_axes(ax, grid_axis="both")
 
 
 # =============================================================================
@@ -411,44 +470,47 @@ def plot_bland_altman(ax, pred: np.ndarray, gt: np.ndarray, pred_label: str,
                       gt_label: str, color: str, bins_hist: int = 30,
                       dilu_classes: np.ndarray | None = None):
     """
-    Bland–Altman: x = mean of two, y = (gt - pred).
+    Error plot in Bland-Altman style: x = GT count, y = (gt - pred).
     Includes marginal histogram on right side.
     Optionally colours points by dilu_class.
     """
-    valid = np.isfinite(pred) & np.isfinite(gt)
+    valid = np.isfinite(pred) & np.isfinite(gt) & (np.abs(gt - pred) <= MAX_ABS_ERROR_FOR_PLOTS)
     p, g = pred[valid], gt[valid]
     if p.size == 0:
         ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
-    mean_val = 0.5 * (p + g)
+    x_val = g
     diff_val = g - p
 
     # Scatter (optionally coloured)
     if dilu_classes is not None:
         dc = dilu_classes[valid]
-        dilu_colors = {0: "#1f77b4", 1: "#2ca02c", 2: "#ff7f0e", 3: "#d62728"}
+        dilu_colors = {0: "#163f6b", 1: "#4f5d2f", 2: "#9a6a12", 3: "#7a1f1f"}
         for d in sorted(dilu_colors):
             m = dc == d
             if np.any(m):
-                ax.scatter(mean_val[m], diff_val[m], s=18, alpha=0.8,
-                           c=dilu_colors[d], label=f"dilu{d}", zorder=3)
-        ax.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
+                ax.scatter(x_val[m], diff_val[m], s=28, alpha=0.85,
+                           c=dilu_colors[d], edgecolors="white", linewidths=0.4,
+                           label=f"dilu{d}", zorder=3)
+        ax.legend(loc="upper right", fontsize=9, ncol=2)
     else:
-        ax.scatter(mean_val, diff_val, s=18, alpha=0.8, color=color, zorder=3)
+        ax.scatter(x_val, diff_val, s=28, alpha=0.82, color=color,
+                   edgecolors="white", linewidths=0.4, zorder=3)
 
     # Stats
     bias = float(np.mean(diff_val))
     sigma = float(np.std(diff_val, ddof=1)) if diff_val.size > 1 else 0.0
     loa = 1.96 * sigma
 
-    ax.axhline(0, linestyle="-", linewidth=0.8, color="black", zorder=1)
-    ax.axhline(bias, linestyle="--", linewidth=1.5, color="darkblue", zorder=2)
-    ax.axhline(bias + loa, linestyle=":", linewidth=1.2, color="red", zorder=2)
-    ax.axhline(bias - loa, linestyle=":", linewidth=1.2, color="red", zorder=2)
+    ax.axhline(0, linestyle="-", linewidth=1.1, color="#111111", zorder=1)
+    ax.axhline(bias, linestyle="--", linewidth=1.7, color="#163f6b", zorder=2)
+    ax.axhline(bias + loa, linestyle=":", linewidth=1.4, color="#8b1e1e", zorder=2)
+    ax.axhline(bias - loa, linestyle=":", linewidth=1.4, color="#8b1e1e", zorder=2)
 
-    ax.set_title(f"Bland–Altman: {pred_label} vs {gt_label}")
-    ax.set_xlabel(f"Mean of {pred_label} & {gt_label}")
+    ax.set_title(f"{pred_label} vs {gt_label}")
+    ax.set_xlabel("GT count")
     ax.set_ylabel(f"{gt_label} − {pred_label}")
 
     ymax = max(np.percentile(np.abs(diff_val), 99), abs(bias) + loa, 1.0) * 1.15
@@ -456,20 +518,94 @@ def plot_bland_altman(ax, pred: np.ndarray, gt: np.ndarray, pred_label: str,
 
     ax.text(0.02, 0.02,
             f"Bias={bias:.2f}  σ={sigma:.2f}  LoA=±{loa:.2f}  n={p.size}",
-            transform=ax.transAxes, ha="left", va="bottom", fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
+            transform=ax.transAxes, ha="left", va="bottom", fontsize=10,
+            fontweight="bold", bbox=STAT_BBOX)
 
     # Marginal histogram
     divider = make_axes_locatable(ax)
     ax_hist = divider.append_axes("right", size="18%", pad=0.08, sharey=ax)
     ax_hist.hist(diff_val, bins=bins_hist, orientation="horizontal",
                  alpha=0.4, color=color, edgecolor="none")
-    ax_hist.axhline(bias, linestyle="--", linewidth=1.2, color="darkblue")
-    ax_hist.axhline(bias + loa, linestyle=":", linewidth=1, color="red")
-    ax_hist.axhline(bias - loa, linestyle=":", linewidth=1, color="red")
+    ax_hist.axhline(bias, linestyle="--", linewidth=1.4, color="#163f6b")
+    ax_hist.axhline(bias + loa, linestyle=":", linewidth=1.2, color="#8b1e1e")
+    ax_hist.axhline(bias - loa, linestyle=":", linewidth=1.2, color="#8b1e1e")
     ax_hist.set_xlabel("n")
     ax_hist.tick_params(axis="y", labelleft=False)
     ax_hist.grid(False)
+    style_axes(ax, grid_axis="y")
+    style_axes(ax_hist, grid_axis=None)
+
+
+def _count_range_edges(values: np.ndarray) -> np.ndarray:
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.array([0.0, 25.0], dtype=float)
+    vmax = float(values.max())
+    if vmax <= 50:
+        step = 10.0
+    elif vmax <= 150:
+        step = 20.0
+    else:
+        step = 25.0
+    upper = step * np.ceil((vmax + 1e-9) / step)
+    if upper <= 0:
+        upper = step
+    return np.arange(0.0, upper + step, step, dtype=float)
+
+
+def plot_error_box_by_count_range(ax, pred: np.ndarray, gt: np.ndarray, label: str, color: str):
+    """
+    Box plot of count errors grouped by GT-count range.
+    """
+    valid = np.isfinite(pred) & np.isfinite(gt) & (np.abs(gt - pred) <= MAX_ABS_ERROR_FOR_PLOTS)
+    p, g = pred[valid], gt[valid]
+    if p.size == 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
+        return
+
+    edges = _count_range_edges(g)
+    if edges.size < 2:
+        edges = np.array([0.0, 25.0], dtype=float)
+
+    errors = g - p
+    box_data = []
+    labels_out = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi == edges[-1]:
+            mask = (g >= lo) & (g <= hi)
+        else:
+            mask = (g >= lo) & (g < hi)
+        if not np.any(mask):
+            continue
+        box_data.append(errors[mask])
+        labels_out.append(f"{int(lo)}-{int(hi)}\n(n={int(mask.sum())})")
+
+    if not box_data:
+        ax.text(0.5, 0.5, "No grouped data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
+        return
+
+    bp = ax.boxplot(
+        box_data,
+        patch_artist=True,
+        showfliers=False,
+        widths=0.65,
+        medianprops=dict(color="#111111", linewidth=1.8),
+        whiskerprops=dict(color="#333333", linewidth=1.2),
+        capprops=dict(color="#333333", linewidth=1.2),
+        boxprops=dict(edgecolor="#333333", linewidth=1.2),
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    ax.axhline(0, linestyle="--", linewidth=1.4, color="#111111")
+    ax.set_xticks(range(1, len(labels_out) + 1))
+    ax.set_xticklabels(labels_out, fontsize=10, fontweight="bold")
+    ax.set_xlabel("GT count range")
+    ax.set_ylabel("GT − Pred")
+    style_axes(ax, grid_axis="y")
 
 
 # =============================================================================
@@ -481,6 +617,7 @@ def plot_size_histogram_comparison(ax, gt_sizes: np.ndarray, pred_sizes: np.ndar
     """Overlaid histograms of CFU pixel areas: GT vs one prediction source."""
     if gt_sizes.size == 0 and pred_sizes.size == 0:
         ax.text(0.5, 0.5, "No size data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     all_vals = np.concatenate([gt_sizes, pred_sizes])
@@ -491,16 +628,17 @@ def plot_size_histogram_comparison(ax, gt_sizes: np.ndarray, pred_sizes: np.ndar
     bin_edges = np.linspace(0, np.percentile(all_vals, 99), bins + 1)
 
     if gt_sizes.size > 0:
-        ax.hist(gt_sizes[gt_sizes > 0], bins=bin_edges, alpha=0.45,
-                color="black", label=f"GT (n={gt_sizes.size})", edgecolor="none")
+        ax.hist(gt_sizes[gt_sizes > 0], bins=bin_edges, alpha=0.55,
+                color="#111111", label=f"GT (n={gt_sizes.size})", edgecolor="white", linewidth=0.5)
     if pred_sizes.size > 0:
-        ax.hist(pred_sizes[pred_sizes > 0], bins=bin_edges, alpha=0.45,
-                color=color_pred, label=f"{pred_label} (n={pred_sizes.size})", edgecolor="none")
+        ax.hist(pred_sizes[pred_sizes > 0], bins=bin_edges, alpha=0.72,
+                color=color_pred, label=f"{pred_label} (n={pred_sizes.size})", edgecolor="white", linewidth=0.5)
 
     ax.set_xlabel("CFU area (px)")
     ax.set_ylabel("Count")
     ax.set_title(f"Size Distribution: GT vs {pred_label}")
-    ax.legend(loc="upper right", fontsize=9)
+    ax.legend(loc="upper right", fontsize=10)
+    style_axes(ax, grid_axis="y")
 
 
 def plot_size_cdf_comparison(ax, gt_sizes: np.ndarray, pred_sizes: np.ndarray,
@@ -517,15 +655,16 @@ def plot_size_cdf_comparison(ax, gt_sizes: np.ndarray, pred_sizes: np.ndarray,
     x_pr, y_pr = _ecdf(pred_sizes)
 
     if x_gt.size > 0:
-        ax.step(x_gt, y_gt, where="post", linewidth=1.5, color="black", label="GT")
+        ax.step(x_gt, y_gt, where="post", linewidth=2.0, color="#111111", label="GT")
     if x_pr.size > 0:
-        ax.step(x_pr, y_pr, where="post", linewidth=1.5, color=color_pred, label=pred_label)
+        ax.step(x_pr, y_pr, where="post", linewidth=2.0, color=color_pred, label=pred_label)
 
     ax.set_xlabel("CFU area (px)")
     ax.set_ylabel("Cumulative fraction")
     ax.set_title(f"CDF: GT vs {pred_label}")
-    ax.legend(loc="lower right", fontsize=9)
+    ax.legend(loc="lower right", fontsize=10)
     ax.set_ylim(0, 1.05)
+    style_axes(ax, grid_axis="both")
 
 
 def plot_size_violin(ax, size_dict: dict[str, np.ndarray], colors: dict[str, str]):
@@ -544,19 +683,25 @@ def plot_size_violin(ax, size_dict: dict[str, np.ndarray], colors: dict[str, str
 
     if not data:
         ax.text(0.5, 0.5, "No size data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     parts = ax.violinplot(data, showmeans=True, showmedians=True, showextrema=False)
     for i, pc in enumerate(parts["bodies"]):
         pc.set_facecolor(cs[i])
-        pc.set_alpha(0.5)
-    parts["cmeans"].set_color("black")
-    parts["cmedians"].set_color("darkred")
+        pc.set_edgecolor("#222222")
+        pc.set_linewidth(0.8)
+        pc.set_alpha(0.55)
+    parts["cmeans"].set_color("#111111")
+    parts["cmeans"].set_linewidth(1.4)
+    parts["cmedians"].set_color("#8b1e1e")
+    parts["cmedians"].set_linewidth(1.6)
 
     ax.set_xticks(range(1, len(labels) + 1))
-    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_xticklabels(labels, fontsize=10, fontweight="bold")
     ax.set_ylabel("CFU area (px)")
     ax.set_title("CFU Size Distributions (Violin)")
+    style_axes(ax, grid_axis="y")
 
 
 def plot_size_boxplot(ax, size_dict: dict[str, np.ndarray], colors: dict[str, str]):
@@ -573,17 +718,22 @@ def plot_size_boxplot(ax, size_dict: dict[str, np.ndarray], colors: dict[str, st
 
     if not data:
         ax.text(0.5, 0.5, "No size data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     bp = ax.boxplot(data, patch_artist=True, showfliers=False, widths=0.6,
-                    medianprops=dict(color="black", linewidth=1.5))
+                    medianprops=dict(color="#111111", linewidth=1.8),
+                    whiskerprops=dict(color="#333333", linewidth=1.2),
+                    capprops=dict(color="#333333", linewidth=1.2),
+                    boxprops=dict(edgecolor="#333333", linewidth=1.2))
     for patch, c in zip(bp["boxes"], cs):
         patch.set_facecolor(c)
-        patch.set_alpha(0.5)
+        patch.set_alpha(0.6)
 
-    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_xticklabels(labels, fontsize=10, fontweight="bold")
     ax.set_ylabel("CFU area (px)")
     ax.set_title("CFU Size Distributions (Box, no outliers)")
+    style_axes(ax, grid_axis="y")
 
 
 def plot_size_qq(ax, gt_sizes: np.ndarray, pred_sizes: np.ndarray,
@@ -594,6 +744,7 @@ def plot_size_qq(ax, gt_sizes: np.ndarray, pred_sizes: np.ndarray,
     if g.size < 2 or p.size < 2:
         ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center",
                 transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     n_q = min(200, g.size, p.size)
@@ -601,14 +752,16 @@ def plot_size_qq(ax, gt_sizes: np.ndarray, pred_sizes: np.ndarray,
     g_q = np.quantile(g, quantiles)
     p_q = np.quantile(p, quantiles)
 
-    ax.scatter(g_q, p_q, s=12, alpha=0.7, color=color, zorder=3)
+    ax.scatter(g_q, p_q, s=24, alpha=0.8, color=color,
+               edgecolors="white", linewidths=0.4, zorder=3)
     lo = min(g_q.min(), p_q.min())
     hi = max(g_q.max(), p_q.max())
-    ax.plot([lo, hi], [lo, hi], "--", linewidth=1, color="gray", zorder=1)
+    ax.plot([lo, hi], [lo, hi], "--", linewidth=1.5, color="#444444", zorder=1)
     ax.set_xlabel("GT size quantiles (px)")
     ax.set_ylabel(f"{pred_label} size quantiles (px)")
     ax.set_title(f"Q-Q: {pred_label} vs GT")
     ax.set_aspect("equal", adjustable="datalim")
+    style_axes(ax, grid_axis="both")
 
 
 def plot_per_dish_mean_size_scatter(ax, matched: pd.DataFrame,
@@ -621,6 +774,7 @@ def plot_per_dish_mean_size_scatter(ax, matched: pd.DataFrame,
     if gt_cfu is None or gt_cfu.empty:
         ax.text(0.5, 0.5, "No GT size data", ha="center", va="center",
                 transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     gt_mean = gt_cfu.groupby("match_key")["cfu_area_px"].mean().rename("gt_mean_area")
@@ -637,7 +791,8 @@ def plot_per_dish_mean_size_scatter(ax, matched: pd.DataFrame,
             continue
 
         ax.scatter(joined["gt_mean_area"], joined["pred_mean_area"],
-                   s=20, alpha=0.7, color=color, label=name, zorder=3)
+                   s=28, alpha=0.82, color=color, edgecolors="white",
+                   linewidths=0.4, label=name, zorder=3)
 
     # y = x
     all_vals = []
@@ -649,12 +804,13 @@ def plot_per_dish_mean_size_scatter(ax, matched: pd.DataFrame,
         pts = np.vstack(all_vals)
         lo = pts.min()
         hi = pts.max()
-        ax.plot([lo, hi], [lo, hi], "--", linewidth=1, color="gray", zorder=1)
+        ax.plot([lo, hi], [lo, hi], "--", linewidth=1.5, color="#444444", zorder=1)
 
     ax.set_xlabel("GT mean CFU area (px)")
     ax.set_ylabel("Pred mean CFU area (px)")
     ax.set_title("Per-Dish Mean CFU Size: Pred vs GT")
-    ax.legend(fontsize=9, loc="upper left")
+    ax.legend(fontsize=10, loc="upper left")
+    style_axes(ax, grid_axis="both")
 
 
 def plot_size_ratio_hist(ax, gt_cfu: pd.DataFrame, pred_cfu: pd.DataFrame,
@@ -664,6 +820,7 @@ def plot_size_ratio_hist(ax, gt_cfu: pd.DataFrame, pred_cfu: pd.DataFrame,
     """
     if gt_cfu is None or gt_cfu.empty or pred_cfu is None or pred_cfu.empty:
         ax.text(0.5, 0.5, "No size data", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     gt_mean = gt_cfu.groupby("match_key")["cfu_area_px"].mean().rename("gt_mean")
@@ -672,25 +829,28 @@ def plot_size_ratio_hist(ax, gt_cfu: pd.DataFrame, pred_cfu: pd.DataFrame,
     joined = joined[(joined["gt_mean"] > 0) & (joined["pred_mean"] > 0)]
     if joined.empty:
         ax.text(0.5, 0.5, "No overlapping dishes", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     ratios = (joined["pred_mean"] / joined["gt_mean"]).to_numpy(dtype=float)
     ratios = ratios[np.isfinite(ratios)]
     if ratios.size == 0:
         ax.text(0.5, 0.5, "No valid ratios", ha="center", va="center", transform=ax.transAxes)
+        style_axes(ax, grid_axis=None)
         return
 
     hi = max(2.5, float(np.percentile(ratios, 99)))
     bin_edges = np.linspace(0, hi, bins + 1)
-    ax.hist(ratios, bins=bin_edges, color=color, alpha=0.7, edgecolor="white", linewidth=0.5)
-    ax.axvline(1.0, linestyle="--", linewidth=1.2, color="black")
+    ax.hist(ratios, bins=bin_edges, color=color, alpha=0.88, edgecolor="white", linewidth=0.7)
+    ax.axvline(1.0, linestyle="--", linewidth=1.5, color="#111111")
     ax.set_xlabel("Pred / GT mean CFU area per dish")
     ax.set_ylabel("Number of dishes")
     ax.set_title(f"Per-Dish Mean-Size Ratio: {pred_label}")
     ax.text(0.98, 0.95,
             f"median={np.median(ratios):.2f}\nmean={np.mean(ratios):.2f}\nn={ratios.size}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
+            transform=ax.transAxes, ha="right", va="top", fontsize=10,
+            fontweight="bold", bbox=STAT_BBOX)
+    style_axes(ax, grid_axis="y")
 
 
 def _cfu_sizes(cfu_df: pd.DataFrame | None) -> np.ndarray:
@@ -748,12 +908,12 @@ def save_counts_dashboard(matched: pd.DataFrame, out_path: Path, labels: dict[st
     gt = matched["gt"].to_numpy(dtype=float)
     active = active_count_sources(matched)
 
-    fig, axes = plt.subplots(1, len(active), figsize=(7 * max(len(active), 1), 5), constrained_layout=True)
+    fig, axes = plt.subplots(1, len(active), figsize=(6.8 * max(len(active), 1), 4.8), constrained_layout=True)
     axes = np.atleast_1d(axes)
     for ax, col in zip(axes, active):
         plot_count_comparison_hist(ax, matched[col].to_numpy(dtype=float), gt, labels[col], colors[col])
-    fig.suptitle("Count Comparison Histograms", fontsize=16)
-    fig.savefig(out_path, dpi=200)
+    fig.suptitle("Count Error Distribution", fontsize=18, fontweight="bold")
+    save_figure(fig, out_path)
     plt.close(fig)
 
 
@@ -765,15 +925,15 @@ def save_regression_dashboard(matched: pd.DataFrame, out_path: Path, labels: dic
     if len(active) == 1:
         gt = matched["gt"].to_numpy(dtype=float)
         col = active[0]
-        fig, ax = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
+        fig, ax = plt.subplots(1, 1, figsize=(6.5, 5.8), constrained_layout=True)
         plot_scatter_regression(ax, matched[col].to_numpy(dtype=float), gt, labels[col], colors[col])
-        fig.suptitle("Regression Analysis" + title_suffix, fontsize=16)
-        fig.savefig(out_path, dpi=200)
+        fig.suptitle("Regression Analysis" + title_suffix, fontsize=18, fontweight="bold")
+        save_figure(fig, out_path)
         plt.close(fig)
         return
 
     ncols = max(2, len(active))
-    fig = plt.figure(figsize=(7 * ncols, 10), constrained_layout=True)
+    fig = plt.figure(figsize=(6.5 * ncols, 9.2), constrained_layout=True)
     gs = GridSpec(2, ncols, figure=fig)
     gt = matched["gt"].to_numpy(dtype=float)
 
@@ -783,15 +943,15 @@ def save_regression_dashboard(matched: pd.DataFrame, out_path: Path, labels: dic
 
     overlay_ax = fig.add_subplot(gs[1, :])
     plot_regression_overlay(overlay_ax, matched, {col: colors[col] for col in active})
-    fig.suptitle("Regression Analysis" + title_suffix, fontsize=16)
-    fig.savefig(out_path, dpi=200)
+    fig.suptitle("Regression Analysis" + title_suffix, fontsize=18, fontweight="bold")
+    save_figure(fig, out_path)
     plt.close(fig)
 
 
 def save_bland_altman_dashboard(matched: pd.DataFrame, out_path: Path, labels: dict[str, str],
                                 colors: dict[str, str], title_suffix: str = ""):
     active = active_count_sources(matched)
-    fig, axes = plt.subplots(len(active), 1, figsize=(10, 5 * max(len(active), 1)), constrained_layout=True)
+    fig, axes = plt.subplots(len(active), 1, figsize=(9.5, 4.8 * max(len(active), 1)), constrained_layout=True)
     axes = np.atleast_1d(axes)
     gt = matched["gt"].to_numpy(dtype=float)
     dilu = matched["dilu_class"].to_numpy(dtype=float)
@@ -799,8 +959,25 @@ def save_bland_altman_dashboard(matched: pd.DataFrame, out_path: Path, labels: d
     for ax, col in zip(axes, active):
         plot_bland_altman(ax, matched[col].to_numpy(dtype=float), gt,
                           labels[col], "GT", colors[col], dilu_classes=dilu)
-    fig.suptitle("Bland-Altman Analysis" + title_suffix, fontsize=16)
-    fig.savefig(out_path, dpi=200)
+    fig.suptitle("Bland-Altman Analysis" + title_suffix, fontsize=18, fontweight="bold")
+    save_figure(fig, out_path)
+    plt.close(fig)
+
+
+def save_error_by_count_range_dashboard(matched: pd.DataFrame, out_path: Path, labels: dict[str, str],
+                                        colors: dict[str, str]):
+    if "cpsam" not in matched.columns or not matched["cpsam"].notna().any():
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(10.5, 5.8), constrained_layout=True)
+    plot_error_box_by_count_range(
+        ax,
+        matched["cpsam"].to_numpy(dtype=float),
+        matched["gt"].to_numpy(dtype=float),
+        labels["cpsam"],
+        colors["cpsam"],
+    )
+    fig.suptitle("CPSAM Error Across GT Count Ranges", fontsize=18, fontweight="bold")
+    save_figure(fig, out_path)
     plt.close(fig)
 
 
@@ -808,7 +985,7 @@ def save_size_dashboard(cfu_dict: dict[str, pd.DataFrame], out_path: Path, color
     gt_sizes = _cfu_sizes(cfu_dict.get("GT"))
     comparisons = active_size_sources(cfu_dict)
     fig, axes = plt.subplots(len(comparisons), 2,
-                             figsize=(14, 5 * max(len(comparisons), 1)),
+                             figsize=(13.5, 4.8 * max(len(comparisons), 1)),
                              constrained_layout=True)
     axes = np.atleast_2d(axes)
 
@@ -817,8 +994,8 @@ def save_size_dashboard(cfu_dict: dict[str, pd.DataFrame], out_path: Path, color
         plot_size_histogram_comparison(axes[row, 0], gt_sizes, pred_sizes, label, colors[key])
         plot_size_cdf_comparison(axes[row, 1], gt_sizes, pred_sizes, label, colors[key])
 
-    fig.suptitle("CFU Size Distributions", fontsize=16)
-    fig.savefig(out_path, dpi=200)
+    fig.suptitle("CFU Size Distributions", fontsize=18, fontweight="bold")
+    save_figure(fig, out_path)
     plt.close(fig)
 
 
@@ -826,7 +1003,7 @@ def save_size_analysis_dashboard(matched: pd.DataFrame, cfu_dict: dict[str, pd.D
                                  out_path: Path, colors: dict[str, str]):
     size_dict = {name: _cfu_sizes(df) for name, df in cfu_dict.items()}
     active_predictions = active_size_sources(cfu_dict)
-    fig = plt.figure(figsize=(16, 16), constrained_layout=True)
+    fig = plt.figure(figsize=(14.5, 14.5), constrained_layout=True)
     gs = GridSpec(3, 2, figure=fig)
 
     ax1 = fig.add_subplot(gs[0, 0])
@@ -857,11 +1034,11 @@ def save_size_analysis_dashboard(matched: pd.DataFrame, cfu_dict: dict[str, pd.D
         )
     ax6.axis("off")
     ax6.text(0.01, 0.99, "\n".join(text_lines) if text_lines else "No size summary data",
-             ha="left", va="top", fontsize=11,
-             bbox=dict(boxstyle="round,pad=0.4", fc="#f5f5f5", ec="#cccccc"))
+             ha="left", va="top", fontsize=11, fontweight="bold",
+             bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#3f3f3f", lw=1.0))
 
-    fig.suptitle("Advanced CFU Size Analysis", fontsize=16)
-    fig.savefig(out_path, dpi=200)
+    fig.suptitle("Advanced CFU Size Analysis", fontsize=18, fontweight="bold")
+    save_figure(fig, out_path)
     plt.close(fig)
 
 
@@ -965,15 +1142,7 @@ def main():
     matched.to_csv(out_dir / "matched_rows.csv", index=False)
 
     labels = {"cpsam": "CPSAM", "algo1": "KC Algorithm", "algo2": "FHN ColonyNet"}
-    colors = {
-        "cpsam": "#1f77b4",
-        "algo1": "#2ca02c",
-        "algo2": "#ff7f0e",
-        "GT": "#000000",
-        "CPSAM": "#1f77b4",
-        "KC Algorithm": "#2ca02c",
-        "FHN ColonyNet": "#ff7f0e",
-    }
+    colors = JOURNAL_COLORS.copy()
 
     active_cols = active_count_sources(matched)
     if not active_cols:
@@ -983,6 +1152,12 @@ def main():
     save_counts_dashboard(matched, out_dir / "dashboard_counts.png", labels, colors)
     save_regression_dashboard(matched, out_dir / "dashboard_regression.png", labels, colors)
     save_bland_altman_dashboard(matched, out_dir / "dashboard_bland_altman.png", labels, colors)
+    save_error_by_count_range_dashboard(
+        matched,
+        out_dir / "dashboard_error_by_count_range.png",
+        labels,
+        colors,
+    )
     if active_regression_sources(matched_trimmed):
         save_regression_dashboard(
             matched_trimmed,

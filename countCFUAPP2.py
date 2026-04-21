@@ -159,29 +159,27 @@ MEDIUM_BLOB_AREA_THRESH = 1_000.0   # median area above this → medium (uses sm
 #   uncountable_*: lowered         — 30 large colonies can already be TNTC.
 
 LARGE_CFU_PARAMS = TuningParams(
-hsv_v_start=0.635,
+hsv_v_start=0.60,
 hsv_v_step=0.05,
-hsv_v_min=0.35,
-hsv_s_min=0.00,
-hsv_err_tol=0.02,          # large colonies on dark agar have ~22% FP floor;
-                            # tighter values can't converge and prevent detection
+hsv_v_min=0.15,
+hsv_s_min=-1.0,
+hsv_err_tol=0.02,
 h_ref_frac=0.10,
-hsv_extent_min=0.23,
-hsv_open_disk_small=3,
-hsv_open_disk_large=18,    # reduced from 30: less erosion of thin colony-rim arcs
-hsv_close_disk_large=25,   # increased from 15: better gap-bridging for large colony rims
-min_object_area=150,       # raised from 90: suppresses tiny agar specks while
-                            # keeping thin arc fragments (~10px × 15px = 150px²)
+hsv_extent_min=0.15,
+hsv_open_disk_small=1,
+hsv_open_disk_large=18,
+hsv_close_disk_large=20,
+min_object_area=300,
 small_area_quantile=0.75,
 small_cluster_extent_min=0.20,
 nonsmall_cluster_ecc_min=0.99,
 nonsmall_cluster_extent_min=0.20,
 colony_circularity_min=0.09,
-ws_thresh_abs_frac=0.12,   # raised from 0.05: require 12% of dmax saddle depth to split
-ws_gauss_sigma=2.0,        # raised from 1.0: smoother DT reduces spurious peaks per colony
+ws_thresh_abs_frac=0.05,
+ws_gauss_sigma=0.3,
 uncountable_cutoff=300,
 uncountable_precheck_cutoff=400,
-large_cfu_mode=True,       # activates large-CFU code paths (skip expansion, refinement)
+large_cfu_mode=True,
 )
 
 
@@ -853,6 +851,16 @@ def hsv_mask_adaptive(
     _dish_nz = gray_expt != 0
     _s_min = float(params.hsv_s_min)
 
+    # Large-CFU mode: after remove_background_rgb(sigma=150) agar normalises to
+    # V≈0.50; large colony interiors are darker (V≈0.15–0.45).  The V histogram
+    # is bimodal (dark colonies vs agar) with Otsu threshold consistently near
+    # V≈0.35–0.37.  The adaptive loop cannot be used here because FP from
+    # agar-below-mean pixels floods the rate at any permissive threshold.
+    if params.large_cfu_mode:
+        _v_nz = ((_V[_dish_nz]) * 255).astype(np.uint8).reshape(-1, 1)
+        _thr_v, _ = cv2.threshold(_v_nz, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return (_V < (_thr_v / 255.0)) & _dish_nz
+
     v_thresh = float(params.hsv_v_start)
     mask = (_V < v_thresh) & (_S > _s_min) & _dish_nz
 
@@ -900,39 +908,29 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
     # arcs survive; keep disk(hsv_open_disk_small) for dense plates where real
     # thin-bridge noise between nearby colonies must be cut.
     _cov_pre = float(np.count_nonzero(bw)) / dish_area if dish_area > 0 else 1.0
-    _open_r = 1 if _cov_pre < 0.08 else int(params.hsv_open_disk_small)
+    _open_r = 1 if (params.large_cfu_mode or _cov_pre < 0.08) else int(params.hsv_open_disk_small)
     bw = binary_opening(bw, footprint=_disk(_open_r))
 
     # 3 — close ring / arc gaps per blob, then fill enclosed holes.
-    # The HSV mask often captures only the dark rim of a colony, leaving
+    # The HSV mask often captures only the bright rim of a colony, leaving
     # C-shapes, arcs, and crescents.  binary_fill_holes requires a fully
     # enclosed hole, so open arcs are not filled.
     # Strategy: for each blob independently dilate → fill → erode back.
-    # Adaptive kernel radius: small blobs are likely thin arc remnants with
-    # wide gaps (20-30 px); they need a larger disk to bridge the gap.
-    # Large blobs (area >= 8000) may have internal holes with thin channels
-    # to the background; hsv_close_disk_large (default 10, 15 for large-CFU
-    # mode) must be wide enough to seal those channels so fill_holes works.
     # Per-blob processing prevents merging of neighbouring colonies.
-    bw_labeled, n_blobs = ndi.label(bw)
+    bw_labeled, _ = ndi.label(bw)
     bw_repaired = np.zeros_like(bw)
     blob_areas = np.bincount(bw_labeled.ravel())
     H, W = bw.shape
-    blob_slices = ndi.find_objects(bw_labeled)  # O(1) bounding boxes, no full-image scan
+    blob_slices = ndi.find_objects(bw_labeled)
     for i, sl in enumerate(blob_slices):
         if sl is None:
             continue
         label_i = i + 1
         area = int(blob_areas[label_i])
         if params.large_cfu_mode:
-            # In large-CFU mode all blobs need generous closing to bridge wide
-            # rim gaps; don't gate on area since even small arc fragments need it.
             r = int(params.hsv_close_disk_large)
         else:
             r = 12 if area < 1500 else (6 if area < 8000 else int(params.hsv_close_disk_large))
-        # Pad the bounding box by r so dilation/erosion have enough room.
-        # Operating on the padded crop instead of the full image reduces cost
-        # from O(H×W) to O((blob_bbox + 2r)²) — ~100–1000× faster per blob.
         r0 = max(0, sl[0].start - r);  r1 = min(H, sl[0].stop + r)
         c0 = max(0, sl[1].start - r);  c1 = min(W, sl[1].stop + r)
         blob_crop = bw_labeled[r0:r1, c0:c1] == label_i
@@ -958,7 +956,17 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
     # Dense/noisy plates need this step to suppress medium-sized agar patches that
     # survived steps 1–5.
     coverage = float(np.count_nonzero(bw)) / dish_area if dish_area > 0 else 1.0
-    if coverage > 0.10:
+    if params.large_cfu_mode:
+        # Remove thin agar patches while keeping compact colonies.
+        # disk=20 on 2× image = effective 10px in original space, which is smaller
+        # than the smallest real colony (area≥662px → radius≥15px).
+        h, w = bw.shape
+        big = cv2.resize(bw.astype(np.uint8), None, fx=2.0, fy=2.0,
+                         interpolation=cv2.INTER_NEAREST) > 0
+        big = binary_opening(big, footprint=_disk(20))
+        bw = cv2.resize(big.astype(np.uint8), (w, h),
+                        interpolation=cv2.INTER_NEAREST) > 0
+    elif coverage > 0.10:
         h, w = bw.shape
         big = cv2.resize(bw.astype(np.uint8), None, fx=2.0, fy=2.0,
                          interpolation=cv2.INTER_NEAREST) > 0
@@ -1323,9 +1331,9 @@ _GRAY_STD_FALLBACK      = 40.0   # fallback: high std + moderate n_local → lar
 # cond3 thresholds: catches low-contrast large-CFU plates (e.g. DIFIP2 at dilu2)
 # where edge_max is always ~750 regardless of CFU size, but n_local and gray_std
 # are elevated compared to nearly-empty small-CFU plates at the same dilution.
-_COND3_NLOC_LO  = 20    # moderate local blob count (more than empty plate)
+_COND3_NLOC_LO  = 8     # moderate local blob count (more than empty plate)
 _COND3_NLOC_HI  = 80    # below this → not an overcrowded/uncountable plate
-_COND3_STD_MIN  = 25.0  # sufficient gray variance to confirm colony signal
+_COND3_STD_MIN  = 20.0  # sufficient gray variance to confirm colony signal (true small-CFU plates always <16)
 
 
 def _blob_size_class_guess(expt_raw: np.ndarray) -> Tuple[str, float, float, float]:
@@ -1589,6 +1597,7 @@ def _count_one_expt_hsv(
         return int(num_unc), "Uncountable", "Uncountable", _mean_region_area(bw_unc), unc_overlay, [], [], bw_unc_rgb
 
     # --- Auto size-adapt: switch to large-CFU params if needed ---
+    _gray_std = float('inf')  # default: unknown → skip uniform-agar global close
     if _auto_adapt:
         _cfu_class, _edge_max, _n_loc, _gray_std = _blob_size_class_guess(expt)
         if _cfu_class == "large":
@@ -1601,21 +1610,20 @@ def _count_one_expt_hsv(
                   f"(edge_max={_edge_max:.0f} n_local={_n_loc:.0f} gray_std={_gray_std:.1f})")
 
     # --- BLOCK 2: adaptive HSV mask ---
-    bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
+    # Use the ORIGINAL image dish mask (not gray_expt) so that corner regions
+    # that leak non-zero values due to the sigma=150 Gaussian background removal
+    # are excluded before masking.  The preprocessed gray_expt != 0 covers the
+    # entire image including zero-padded corners, causing 4 large FP corner blobs.
+    dish_mask_orig = np.any(expt > 0, axis=2)
+    bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params) & dish_mask_orig
 
     # --- BLOCK 3: morphological cleanup ---
-    dish_area = int(np.count_nonzero(gray_expt != 0))
+    dish_area = int(np.count_nonzero(dish_mask_orig))
     bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
     # --- Rim filter: remove blobs that own ≥20% of the dish border zone ---
-    # IMPORTANT: use the original expt (not gray_expt) for the dish mask.
-    # The preprocessing filters (Gaussian, localcontrast, diffusion) spread
-    # non-zero values into the outer black region, so gray_expt != 0 covers
-    # nearly the whole image and produces no useful border zone.
-    # The original expt has clean hard zeros outside the circular crop.
-    dish_mask_orig = np.any(expt > 0, axis=2)
     _large_mode = params.large_cfu_mode
-    _rim_iters = 5 if _large_mode else 12
+    _rim_iters = 25 if _large_mode else 12
     border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
     n_border = int(np.count_nonzero(border_px))
     bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
@@ -1652,7 +1660,7 @@ def _count_one_expt_hsv(
     else:
         bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area,
                                                         large_cfu_mode=False)
-    bw_segment = _remove_edge_bar_artifacts(bw_segment)
+    bw_segment = _remove_edge_bar_artifacts(bw_segment) & dish_mask_orig
 
     # --- BLOCKS 4+5+6: candidate filtering + watershed + count/ROI ---
     # Pass the ORIGINAL (non-preprocessed) image so the green overlay lands
@@ -1713,12 +1721,12 @@ def predict_count_only_hsv(
             total += int(num_unc)
             continue
 
-        bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
-        dish_area = int(np.count_nonzero(gray_expt != 0))
+        dish_mask_orig = np.any(expt > 0, axis=2)
+        bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params) & dish_mask_orig
+        dish_area = int(np.count_nonzero(dish_mask_orig))
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
-        dish_mask_orig = np.any(expt > 0, axis=2)
-        _rim_iters = 5 if _large_mode else 12
+        _rim_iters = 25 if _large_mode else 12
         border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
@@ -1729,7 +1737,7 @@ def predict_count_only_hsv(
         else:
             bw_segment = _expand_mask_to_dark_colony_halos(bw_clean, expt, gray_expt, dish_area,
                                                             large_cfu_mode=False)
-        bw_segment = _remove_edge_bar_artifacts(bw_segment)
+        bw_segment = _remove_edge_bar_artifacts(bw_segment) & dish_mask_orig
 
         num_cfu, _, _, _, _ = _count_colonies_with_instances(
             bw_segment, expt, params, build_overlay=False, build_rois=False,
@@ -1811,17 +1819,17 @@ def predict_tuning_features(
             continue
 
         # --- BLOCK 2: adaptive HSV mask ---
-        bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params)
+        dish_mask_orig = np.any(expt > 0, axis=2)
+        bw_raw = hsv_mask_adaptive(expt_adj, gray_expt, params) & dish_mask_orig
 
         # --- BLOCK 3: morphological cleanup ---
-        dish_area = int(np.count_nonzero(gray_expt != 0))
+        dish_area = int(np.count_nonzero(dish_mask_orig))
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
         # --- Rim filter ---
         # Old file used 5 erosion iterations (~10px border zone); new default
         # is 12 (~24px).  The wider zone trims or removes large colonies near
         # the dish rim.  Restore the narrower zone for large-CFU mode only.
-        dish_mask_orig = np.any(expt > 0, axis=2)
         _rim_iters = 5 if _large_cfu_mode else 12
         border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
         n_border = int(np.count_nonzero(border_px))
@@ -1840,7 +1848,7 @@ def predict_tuning_features(
                 bw_clean, expt, gray_expt, dish_area,
                 large_cfu_mode=False,
             )
-        bw_segment = _remove_edge_bar_artifacts(bw_segment)
+        bw_segment = _remove_edge_bar_artifacts(bw_segment) & dish_mask_orig
         _binary_parts.append(bw_segment)
 
         # --- BLOCKS 4+5+6: count + instance labels ---

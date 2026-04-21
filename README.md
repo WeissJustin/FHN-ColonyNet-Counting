@@ -102,7 +102,7 @@ More information and graphics of the setup in the Report that can be found above
  
 ## Demo
 
-![Demo](./Extras/animation.gif)
+![Demo](./Extras/animation.mp4)
 
 ---
  

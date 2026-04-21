@@ -102,7 +102,8 @@ More information and graphics of the setup in the Report that can be found above
  
 ## Demo
 
-![til](https://raw.githubusercontent.com/WeissJustin/FHN-ColonyNet-Counting/Extras/animation.gif)
+![Demo](Extras/animation.gif)
+
 ---
  
 ## Acknowledgments

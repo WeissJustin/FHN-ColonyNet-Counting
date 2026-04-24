@@ -29,6 +29,8 @@ Outputs (in out_dir):
   dashboard_bland_altman.png— Bland–Altman plots
   dashboard_bland_altman_trimmed.png — Bland–Altman plots, without 20 biggest errors
   dashboard_error_by_count_range.png — CPSAM error box plot across predicted-count ranges
+  dashboard_error_by_count_range_trimmed.png — same, without 20 biggest errors
+  dashboard_top_errors_grid_{source}.png — image grid of top-20 error dishes (requires --image_dir)
   dashboard_sizes.png       — size distribution plots (train mode only)
   dashboard_size_analysis.png — advanced size analysis (train mode only)
   summary.txt               — console summary saved to file
@@ -64,32 +66,36 @@ JOURNAL_COLORS = {
 STAT_BBOX = dict(boxstyle="round,pad=0.28", fc="white", ec="#3f3f3f", lw=0.9, alpha=0.96)
 
 matplotlib.rcParams.update({
-    "font.family": "DejaVu Serif",
-    "font.size": 12,
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Helvetica", "Helvetica Neue", "Arial", "DejaVu Sans"],
+    "font.size": 22,
     "font.weight": "bold",
-    "axes.titlesize": 15,
+    "axes.titlesize": 26,
     "axes.titleweight": "bold",
-    "axes.labelsize": 13,
+    "axes.labelsize": 24,
     "axes.labelweight": "bold",
-    "axes.linewidth": 1.4,
+    "axes.linewidth": 3.5,
     "axes.facecolor": "white",
     "figure.facecolor": "white",
     "savefig.facecolor": "white",
-    "xtick.labelsize": 11,
-    "ytick.labelsize": 11,
-    "xtick.major.width": 1.2,
-    "ytick.major.width": 1.2,
-    "xtick.major.size": 5.5,
-    "ytick.major.size": 5.5,
-    "legend.fontsize": 10,
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 20,
+    "xtick.major.width": 3.2,
+    "ytick.major.width": 3.2,
+    "xtick.major.size": 10.0,
+    "ytick.major.size": 10.0,
+    "legend.fontsize": 19,
     "legend.frameon": False,
-    "figure.titlesize": 18,
+    "figure.titlesize": 30,
     "figure.titleweight": "bold",
     "grid.color": "#d7d7d7",
-    "grid.linewidth": 0.8,
+    "grid.linewidth": 1.5,
     "grid.linestyle": "-",
     "axes.grid": False,
-    "mathtext.fontset": "dejavuserif",
+    "mathtext.fontset": "custom",
+    "mathtext.rm": "Helvetica",
+    "mathtext.it": "Helvetica:italic",
+    "mathtext.bf": "Helvetica:bold",
     "pdf.fonttype": 42,
     "ps.fonttype": 42,
 })
@@ -98,9 +104,9 @@ matplotlib.rcParams.update({
 def style_axes(ax, grid_axis: str = "y"):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_linewidth(1.4)
-    ax.spines["bottom"].set_linewidth(1.4)
-    ax.tick_params(axis="both", which="major", width=1.2, length=5.5)
+    ax.spines["left"].set_linewidth(2.8)
+    ax.spines["bottom"].set_linewidth(2.8)
+    ax.tick_params(axis="both", which="major", width=2.6, length=8.0)
     for tick_label in ax.get_xticklabels() + ax.get_yticklabels():
         tick_label.set_fontweight("bold")
     if grid_axis:
@@ -364,7 +370,7 @@ def plot_count_comparison_hist(ax, pred: np.ndarray, gt: np.ndarray, label: str,
     ax.set_xlabel("GT − Pred")
     ax.set_ylabel("Number of dishes")
     ax.text(0.98, 0.95, f"MAE={mae:.1f}\nBias={mean_d:.1f}\nn={diffs.size}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=10,
+            transform=ax.transAxes, ha="right", va="top", fontsize=15,
             fontweight="bold", bbox=STAT_BBOX)
     style_axes(ax, grid_axis="y")
 
@@ -411,7 +417,7 @@ def plot_scatter_regression(ax, pred: np.ndarray, gt: np.ndarray, label: str,
     if show_stats:
         mae = float(np.mean(np.abs(gt_v - pred_v)))
         ax.text(0.02, 0.95, f"n={pred_v.size}\nMAE={mae:.1f}\nR²={r2:.3f}",
-                transform=ax.transAxes, ha="left", va="top", fontsize=10,
+                transform=ax.transAxes, ha="left", va="top", fontsize=15,
                 fontweight="bold", bbox=STAT_BBOX)
 
     style_axes(ax, grid_axis="both")
@@ -458,7 +464,7 @@ def plot_regression_overlay(ax, matched: pd.DataFrame, sources: dict[str, str]):
     ax.set_xlabel("Predicted count")
     ax.set_ylabel("GT count")
     ax.set_title("Regression Overlay: All Methods vs GT")
-    ax.legend(loc="upper left", fontsize=10)
+    ax.legend(loc="upper left", fontsize=15)
     style_axes(ax, grid_axis="both")
 
 
@@ -494,7 +500,7 @@ def plot_bland_altman(ax, pred: np.ndarray, gt: np.ndarray, pred_label: str,
                 ax.scatter(x_val[m], diff_val[m], s=28, alpha=0.85,
                            c=dilu_colors[d], edgecolors="white", linewidths=0.4,
                            label=f"dilu{d}", zorder=3)
-        ax.legend(loc="upper right", fontsize=9, ncol=2)
+        ax.legend(loc="upper right", fontsize=14, ncol=2)
     else:
         ax.scatter(x_val, diff_val, s=28, alpha=0.82, color=color,
                    edgecolors="white", linewidths=0.4, zorder=3)
@@ -518,7 +524,7 @@ def plot_bland_altman(ax, pred: np.ndarray, gt: np.ndarray, pred_label: str,
 
     ax.text(0.02, 0.02,
             f"Bias={bias:.2f}  σ={sigma:.2f}  LoA=±{loa:.2f}  n={p.size}",
-            transform=ax.transAxes, ha="left", va="bottom", fontsize=10,
+            transform=ax.transAxes, ha="left", va="bottom", fontsize=15,
             fontweight="bold", bbox=STAT_BBOX)
 
     # Marginal histogram
@@ -602,7 +608,7 @@ def plot_error_box_by_count_range(ax, pred: np.ndarray, gt: np.ndarray, label: s
 
     ax.axhline(0, linestyle="--", linewidth=1.4, color="#111111")
     ax.set_xticks(range(1, len(labels_out) + 1))
-    ax.set_xticklabels(labels_out, fontsize=10, fontweight="bold")
+    ax.set_xticklabels(labels_out, fontsize=15, fontweight="bold")
     ax.set_xlabel("GT count range")
     ax.set_ylabel("GT − Pred")
     style_axes(ax, grid_axis="y")
@@ -637,7 +643,7 @@ def plot_size_histogram_comparison(ax, gt_sizes: np.ndarray, pred_sizes: np.ndar
     ax.set_xlabel("CFU area (px)")
     ax.set_ylabel("Count")
     ax.set_title(f"Size Distribution: GT vs {pred_label}")
-    ax.legend(loc="upper right", fontsize=10)
+    ax.legend(loc="upper right", fontsize=15)
     style_axes(ax, grid_axis="y")
 
 
@@ -662,7 +668,7 @@ def plot_size_cdf_comparison(ax, gt_sizes: np.ndarray, pred_sizes: np.ndarray,
     ax.set_xlabel("CFU area (px)")
     ax.set_ylabel("Cumulative fraction")
     ax.set_title(f"CDF: GT vs {pred_label}")
-    ax.legend(loc="lower right", fontsize=10)
+    ax.legend(loc="lower right", fontsize=15)
     ax.set_ylim(0, 1.05)
     style_axes(ax, grid_axis="both")
 
@@ -698,7 +704,7 @@ def plot_size_violin(ax, size_dict: dict[str, np.ndarray], colors: dict[str, str
     parts["cmedians"].set_linewidth(1.6)
 
     ax.set_xticks(range(1, len(labels) + 1))
-    ax.set_xticklabels(labels, fontsize=10, fontweight="bold")
+    ax.set_xticklabels(labels, fontsize=15, fontweight="bold")
     ax.set_ylabel("CFU area (px)")
     ax.set_title("CFU Size Distributions (Violin)")
     style_axes(ax, grid_axis="y")
@@ -730,7 +736,7 @@ def plot_size_boxplot(ax, size_dict: dict[str, np.ndarray], colors: dict[str, st
         patch.set_facecolor(c)
         patch.set_alpha(0.6)
 
-    ax.set_xticklabels(labels, fontsize=10, fontweight="bold")
+    ax.set_xticklabels(labels, fontsize=15, fontweight="bold")
     ax.set_ylabel("CFU area (px)")
     ax.set_title("CFU Size Distributions (Box, no outliers)")
     style_axes(ax, grid_axis="y")
@@ -809,7 +815,7 @@ def plot_per_dish_mean_size_scatter(ax, matched: pd.DataFrame,
     ax.set_xlabel("GT mean CFU area (px)")
     ax.set_ylabel("Pred mean CFU area (px)")
     ax.set_title("Per-Dish Mean CFU Size: Pred vs GT")
-    ax.legend(fontsize=10, loc="upper left")
+    ax.legend(fontsize=15, loc="upper left")
     style_axes(ax, grid_axis="both")
 
 
@@ -848,7 +854,7 @@ def plot_size_ratio_hist(ax, gt_cfu: pd.DataFrame, pred_cfu: pd.DataFrame,
     ax.set_title(f"Per-Dish Mean-Size Ratio: {pred_label}")
     ax.text(0.98, 0.95,
             f"median={np.median(ratios):.2f}\nmean={np.mean(ratios):.2f}\nn={ratios.size}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=10,
+            transform=ax.transAxes, ha="right", va="top", fontsize=15,
             fontweight="bold", bbox=STAT_BBOX)
     style_axes(ax, grid_axis="y")
 
@@ -912,7 +918,7 @@ def save_counts_dashboard(matched: pd.DataFrame, out_path: Path, labels: dict[st
     axes = np.atleast_1d(axes)
     for ax, col in zip(axes, active):
         plot_count_comparison_hist(ax, matched[col].to_numpy(dtype=float), gt, labels[col], colors[col])
-    fig.suptitle("Count Error Distribution", fontsize=18, fontweight="bold")
+    fig.suptitle("Count Error Distribution", fontsize=22, fontweight="bold")
     save_figure(fig, out_path)
     plt.close(fig)
 
@@ -927,7 +933,7 @@ def save_regression_dashboard(matched: pd.DataFrame, out_path: Path, labels: dic
         col = active[0]
         fig, ax = plt.subplots(1, 1, figsize=(6.5, 5.8), constrained_layout=True)
         plot_scatter_regression(ax, matched[col].to_numpy(dtype=float), gt, labels[col], colors[col])
-        fig.suptitle("Regression Analysis" + title_suffix, fontsize=18, fontweight="bold")
+        fig.suptitle("Regression Analysis" + title_suffix, fontsize=22, fontweight="bold")
         save_figure(fig, out_path)
         plt.close(fig)
         return
@@ -943,7 +949,7 @@ def save_regression_dashboard(matched: pd.DataFrame, out_path: Path, labels: dic
 
     overlay_ax = fig.add_subplot(gs[1, :])
     plot_regression_overlay(overlay_ax, matched, {col: colors[col] for col in active})
-    fig.suptitle("Regression Analysis" + title_suffix, fontsize=18, fontweight="bold")
+    fig.suptitle("Regression Analysis" + title_suffix, fontsize=22, fontweight="bold")
     save_figure(fig, out_path)
     plt.close(fig)
 
@@ -959,26 +965,129 @@ def save_bland_altman_dashboard(matched: pd.DataFrame, out_path: Path, labels: d
     for ax, col in zip(axes, active):
         plot_bland_altman(ax, matched[col].to_numpy(dtype=float), gt,
                           labels[col], "GT", colors[col], dilu_classes=dilu)
-    fig.suptitle("Bland-Altman Analysis" + title_suffix, fontsize=18, fontweight="bold")
+    fig.suptitle("Bland-Altman Analysis" + title_suffix, fontsize=22, fontweight="bold")
     save_figure(fig, out_path)
     plt.close(fig)
 
 
 def save_error_by_count_range_dashboard(matched: pd.DataFrame, out_path: Path, labels: dict[str, str],
-                                        colors: dict[str, str]):
-    if "cpsam" not in matched.columns or not matched["cpsam"].notna().any():
+                                        colors: dict[str, str], title_suffix: str = ""):
+    active = active_count_sources(matched)
+    if not active:
         return
-    fig, ax = plt.subplots(1, 1, figsize=(10.5, 5.8), constrained_layout=True)
-    plot_error_box_by_count_range(
-        ax,
-        matched["cpsam"].to_numpy(dtype=float),
-        matched["gt"].to_numpy(dtype=float),
-        labels["cpsam"],
-        colors["cpsam"],
-    )
-    fig.suptitle("CPSAM Error Across GT Count Ranges", fontsize=18, fontweight="bold")
+    gt = matched["gt"].to_numpy(dtype=float)
+    fig, axes = plt.subplots(1, len(active), figsize=(10.5 * len(active), 6.5), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    for ax, col in zip(axes, active):
+        plot_error_box_by_count_range(
+            ax,
+            matched[col].to_numpy(dtype=float),
+            gt,
+            labels[col],
+            colors[col],
+        )
+        ax.set_title(labels[col])
+    fig.suptitle("Error Across GT Count Ranges" + title_suffix, fontsize=22, fontweight="bold")
     save_figure(fig, out_path)
     plt.close(fig)
+
+
+def _find_image_file(dish_name: str, image_dir: Path) -> Path | None:
+    stem = Path(dish_name).stem
+    for ext in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+        p = image_dir / (stem + ext)
+        if p.exists():
+            return p
+    for p in image_dir.glob(f"{stem}*"):
+        if p.suffix.lower() in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+            return p
+    return None
+
+
+def save_top_errors_image_grid(
+    matched: pd.DataFrame,
+    labels: dict[str, str],
+    image_dir: Path,
+    out_dir: Path,
+    top_n: int = 20,
+):
+    try:
+        from PIL import Image as _PILImage
+        _has_pil = True
+    except ImportError:
+        _has_pil = False
+
+    gt = matched["gt"].to_numpy(dtype=float)
+    ncols = 4
+
+    for col in ("cpsam", "algo1", "algo2"):
+        if col not in matched.columns or not matched[col].notna().any():
+            continue
+
+        pred = matched[col].to_numpy(dtype=float)
+        valid = np.isfinite(pred) & np.isfinite(gt)
+        if valid.sum() == 0:
+            continue
+
+        all_cands = matched[valid].copy()
+        all_cands = all_cands.assign(_pred=pred[valid])
+        all_cands["_error"] = all_cands["gt"] - all_cands["_pred"]
+        all_cands["_abs_error"] = all_cands["_error"].abs()
+        all_cands = all_cands.sort_values("_abs_error", ascending=False).reset_index(drop=True)
+
+        # Walk down the ranked list and keep only rows whose image exists,
+        # falling back to the 21st, 22nd, … worst until top_n are found.
+        rows_with_img = []
+        img_paths = []
+        for _, row in all_cands.iterrows():
+            img_path = _find_image_file(row["petri_dish"], image_dir)
+            if img_path is not None:
+                rows_with_img.append(row)
+                img_paths.append(img_path)
+            if len(rows_with_img) == top_n:
+                break
+        sub = pd.DataFrame(rows_with_img).reset_index(drop=True)
+
+        if sub.empty:
+            print(f"[Warning] No images found for any top-error dish ({labels[col]}); skipping grid.")
+            continue
+
+        nrows = int(np.ceil(len(sub) / ncols))
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(ncols * 3.6, nrows * 3.4),
+                                 constrained_layout=True)
+        axes = np.array(axes).reshape(-1)
+
+        for i, ((_, row), img_path) in enumerate(zip(sub.iterrows(), img_paths)):
+            ax = axes[i]
+            try:
+                if _has_pil:
+                    img = np.array(_PILImage.open(img_path).convert("RGB"))
+                else:
+                    img = plt.imread(str(img_path))
+                ax.imshow(img)
+            except Exception:
+                ax.set_facecolor("#e8e8e8")
+                ax.text(0.5, 0.5, "Load error", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=13, fontweight="bold")
+
+            dish_short = Path(row["petri_dish"]).stem
+            if len(dish_short) > 26:
+                dish_short = dish_short[:25] + "…"
+            ax.set_title(
+                f"{dish_short}\nGT={row['gt']:.0f}  Pred={row['_pred']:.0f}"
+                f"\nErr={row['_error']:+.0f}  |Err|={row['_abs_error']:.0f}",
+                fontsize=13, fontweight="bold", pad=3,
+            )
+            ax.axis("off")
+
+        for ax in axes[len(sub):]:
+            ax.set_visible(False)
+
+        fig.suptitle(f"Top {len(sub)} Biggest Errors: {labels[col]}",
+                     fontsize=20, fontweight="bold")
+        save_figure(fig, out_dir / f"dashboard_top_errors_grid_{col}.png")
+        plt.close(fig)
 
 
 def save_size_dashboard(cfu_dict: dict[str, pd.DataFrame], out_path: Path, colors: dict[str, str]):
@@ -994,7 +1103,7 @@ def save_size_dashboard(cfu_dict: dict[str, pd.DataFrame], out_path: Path, color
         plot_size_histogram_comparison(axes[row, 0], gt_sizes, pred_sizes, label, colors[key])
         plot_size_cdf_comparison(axes[row, 1], gt_sizes, pred_sizes, label, colors[key])
 
-    fig.suptitle("CFU Size Distributions", fontsize=18, fontweight="bold")
+    fig.suptitle("CFU Size Distributions", fontsize=22, fontweight="bold")
     save_figure(fig, out_path)
     plt.close(fig)
 
@@ -1034,10 +1143,10 @@ def save_size_analysis_dashboard(matched: pd.DataFrame, cfu_dict: dict[str, pd.D
         )
     ax6.axis("off")
     ax6.text(0.01, 0.99, "\n".join(text_lines) if text_lines else "No size summary data",
-             ha="left", va="top", fontsize=11, fontweight="bold",
+             ha="left", va="top", fontsize=14, fontweight="bold",
              bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#3f3f3f", lw=1.0))
 
-    fig.suptitle("Advanced CFU Size Analysis", fontsize=18, fontweight="bold")
+    fig.suptitle("Advanced CFU Size Analysis", fontsize=22, fontweight="bold")
     save_figure(fig, out_path)
     plt.close(fig)
 
@@ -1112,25 +1221,29 @@ def build_top_error_lines(matched: pd.DataFrame, labels: dict[str, str], top_n: 
 
 def main():
     ap = argparse.ArgumentParser(description="Create count and size comparison dashboards.")
-    ap.add_argument("--CPSAM_csv", required=True, help="CPSAM per-CFU CSV")
-    ap.add_argument("--Algo1_csv", help="KC Algorithm per-CFU CSV")
-    ap.add_argument("--Algo2_csv", help="FHN ColonyNet per-CFU CSV")
+    ap.add_argument("--CPSAM_csv", help="CPSAM per-CFU CSV")
+    ap.add_argument("--KC_csv", help="KC Algorithm per-CFU CSV")
+    ap.add_argument("--ColonyNet_csv", help="FHN ColonyNet per-CFU CSV")
     ap.add_argument("--GT_csv", required=True, help="Ground-truth CSV")
     ap.add_argument("--mode", choices=["test", "train"], default="test",
                     help="Use train to enable size distribution plots")
     ap.add_argument("--out_dir", default="plot_dashboard_out", help="Output directory")
+    ap.add_argument("--image_dir", default=None,
+                    help="Directory of source images; enables top-error image grid plots")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cpsam_dish, cpsam_cfu = load_prediction_csv(args.CPSAM_csv, "CPSAM")
+    cpsam_dish, cpsam_cfu = (None, pd.DataFrame())
+    if args.CPSAM_csv:
+        cpsam_dish, cpsam_cfu = load_prediction_csv(args.CPSAM_csv, "CPSAM")
     algo1_dish, algo1_cfu = (None, pd.DataFrame())
     algo2_dish, algo2_cfu = (None, pd.DataFrame())
-    if args.Algo1_csv:
-        algo1_dish, algo1_cfu = load_prediction_csv(args.Algo1_csv, "KC Algorithm")
-    if args.Algo2_csv:
-        algo2_dish, algo2_cfu = load_prediction_csv(args.Algo2_csv, "FHN ColonyNet")
+    if args.KC_csv:
+        algo1_dish, algo1_cfu = load_prediction_csv(args.KC_csv, "KC Algorithm")
+    if args.ColonyNet_csv:
+        algo2_dish, algo2_cfu = load_prediction_csv(args.ColonyNet_csv, "FHN ColonyNet")
     gt_dish, gt_cfu = load_gt_csv(args.GT_csv, args.mode)
 
     matched = build_matched_table(gt_dish, cpsam_dish, algo1_dish, algo2_dish)
@@ -1158,6 +1271,13 @@ def main():
         labels,
         colors,
     )
+    save_error_by_count_range_dashboard(
+        matched_trimmed,
+        out_dir / "dashboard_error_by_count_range_trimmed.png",
+        labels,
+        colors,
+        title_suffix=" (without 20 biggest errors)",
+    )
     if active_regression_sources(matched_trimmed):
         save_regression_dashboard(
             matched_trimmed,
@@ -1173,6 +1293,13 @@ def main():
             colors,
             title_suffix=" (without 20 biggest errors)",
         )
+
+    if args.image_dir:
+        image_dir = Path(args.image_dir).expanduser().resolve()
+        if image_dir.is_dir():
+            save_top_errors_image_grid(matched, labels, image_dir, out_dir, top_n=20)
+        else:
+            print(f"[Warning] --image_dir '{image_dir}' does not exist or is not a directory; skipping image grid.")
 
     cfu_dict = {"GT": gt_cfu, "CPSAM": cpsam_cfu, "KC Algorithm": algo1_cfu, "FHN ColonyNet": algo2_cfu}
     if args.mode == "train":

@@ -6,7 +6,7 @@
 # Uses contour-based circle initialization, edge-score center refinement, and
 # a fixed target dish area for stable output size.
 #
-# Version: 1.1 (13-04-2026)
+# Version: 1.2 (23-04-2026)
 # ------------------------------
 
 import argparse
@@ -46,7 +46,7 @@ BAR_Q = 15                 # Row-wise 10th percentile intensity (robust to colon
 BAR_FRAC_THRESH = 0.3     # Row is "bar" if row_stat < median(row_stat) * BAR_FRAC_THRESH
 BAR_MIN_THICK_PX = 10      # ignore tiny runs (noise)
 BAR_MAX_THICK_PX = 60     # ignore huge dark regions (bad illumination / glove)
-BAR_SPLIT_MARGIN_PX = 20   # don’t include the divider pixels in either half
+BAR_SPLIT_MARGIN_PX = 30   # don’t include the divider pixels in either half
 BAR_BALANCE_WEIGHT = 1.35  # favor runs that split the dish into similarly sized halves
 BAR_RELAXED_FRAC_MULT = 1.35
 BAR_RELAXED_MIN_THICK = 15
@@ -57,9 +57,14 @@ BAR_LINE_SCORE_THRESH_AUTO = 1.15
 
 # Dish rim and seam cleanup.
 BORDER_EROSION_PX = 25          # 15-25 px works well for ~1700 px dishes
-BAR_CLEANUP_BAND_PX = 60        # how many rows from the seam to inspect
+BAR_CLEANUP_BAND_PX = 60        # legacy constant, now overridden by dynamic formula
 BAR_CLEANUP_DARK_THRESH_FRAC = 0.45   # row is "bar remnant" if < 45 % of dish median
 BAR_ADAPTIVE_MARGIN_MULT = 1.9  # widen detected bar extent by this factor
+
+# Pre-split bar component masking (finds full bar including angled/tapered ends).
+BAR_PREMASK_DARK_FRAC    = 0.40   # pixels below this fraction of dish median are "bar"
+BAR_PREMASK_SEARCH_FRAC  = 0.22   # search ± this fraction of image height around bar center
+BAR_PREMASK_DILATION_PX  = 25     # dilate bar component mask to cover thin taper edges
 
 # Fallback parameter sets for initial ellipse detection.
 PARAM_SETS = [
@@ -78,6 +83,77 @@ PARAM_SETS = [
 # ----------------------------
 # Mask and edge helpers
 # ----------------------------
+
+def build_bar_mask(brightness, ellipse, bar_y_center,
+                   search_half_frac=BAR_PREMASK_SEARCH_FRAC,
+                   dark_frac=BAR_PREMASK_DARK_FRAC,
+                   dilation_px=BAR_PREMASK_DILATION_PX):
+    """
+    Find the complete bar extent (including angled/tapered ends) by locating
+    the largest dark connected component in a band around bar_y_center, then
+    dilating it.  Returns a boolean mask (True = bar pixel, inside dish only).
+
+    Called BEFORE the split so both halves come out bar-free.
+    """
+    h, w = brightness.shape[:2]
+
+    dish_img = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(dish_img, ellipse, 255, -1)
+    inside = dish_img > 0
+
+    search_half = max(80, int(search_half_frac * h))
+    y0 = max(0, bar_y_center - search_half)
+    y1 = min(h, bar_y_center + search_half + 1)
+
+    # Brightness reference from the far side of the dish (avoids bar contamination).
+    ref = inside.copy()
+    ref[y0:y1, :] = False
+    ref_vals = brightness[ref]
+    if ref_vals.size < 100:
+        ref_vals = brightness[inside]
+    dish_med = float(np.median(ref_vals))
+    thresh = dish_med * dark_frac
+
+    band = np.zeros((h, w), dtype=bool)
+    band[y0:y1, :] = True
+    dark = inside & band & (brightness.astype(np.float32) < thresh)
+
+    if not dark.any():
+        return np.zeros((h, w), dtype=bool)
+
+    # Bridge horizontal gaps in the bar before finding components.
+    dark_u8 = cv2.morphologyEx(
+        (dark.astype(np.uint8) * 255),
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (25, 7)),
+        iterations=2,
+    )
+
+    n, lab = cv2.connectedComponents(dark_u8, connectivity=8)
+
+    # Pick the component that is widest and closest to bar_y_center.
+    best_lbl, best_score = None, -1.0
+    for lbl in range(1, n):
+        ys_l, xs_l = np.where(lab == lbl)
+        if ys_l.size < 20:
+            continue
+        comp_w = int(xs_l.max() - xs_l.min() + 1)
+        cy_l = float(ys_l.mean())
+        dist = abs(cy_l - bar_y_center) / max(1.0, h * 0.10)
+        score = comp_w / float(w) - 0.20 * dist
+        if score > best_score:
+            best_score, best_lbl = score, lbl
+
+    bar = (lab == best_lbl) if best_lbl is not None else dark
+
+    if dilation_px > 0:
+        kern = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * dilation_px + 1, 2 * dilation_px + 1))
+        bar = cv2.dilate((bar.astype(np.uint8) * 255), kern, iterations=1) > 0
+
+    return bar & inside
+
+
 def make_eroded_ellipse_mask(shape_hw, ellipse, erosion_px):
     """
     Draw a filled ellipse mask, then erode it inward by `erosion_px`
@@ -96,88 +172,144 @@ def make_eroded_ellipse_mask(shape_hw, ellipse, erosion_px):
 
 def cleanup_bar_remnants(masked_half, brightness, ellipse,
                          seam_side="bottom",
-                         band_px=BAR_CLEANUP_BAND_PX,
+                         band_px=None,
                          dark_frac=BAR_CLEANUP_DARK_THRESH_FRAC):
     """
     Remove leftover divider-bar pixels near the split seam.
 
-    The first pass blacks out dark seam rows; the second pass removes dark
-    connected components in the seam band when they touch the cut edge or span
-    like a bar. Isolated round colonies near the seam are preserved.
+    Pass 1 scans from the seam inward using the p10 of VISIBLE pixels per row
+    (catches bar even when it covers only a small fraction of a row).  It stops
+    after 5 consecutive clean rows so colonies away from the seam are not
+    disturbed.  Pass 2 removes any remaining dark connected components that
+    touch the new seam edge and have a bar-like shape (wide, thin).
 
     Parameters
     ----------
     masked_half : BGR image (already masked outside the dish)
     brightness  : single-channel brightness of the *original* image
     ellipse     : detected dish ellipse
-    seam_side   : "bottom" if this is the TOP half (its dark seam is at
-                  the bottom), "top" if this is the BOTTOM half.
+    seam_side   : "bottom" if this is the TOP half (dark seam at bottom),
+                  "top"    if this is the BOTTOM half (dark seam at top).
+    band_px     : rows from seam to search; None → 30 % of image height.
     """
     h, w = masked_half.shape[:2]
-    dish_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.ellipse(dish_mask, ellipse, 255, -1)
-    inside = dish_mask > 0
+    if band_px is None:
+        band_px = min(250, max(80, int(0.30 * h)))
 
-    dish_vals = brightness[inside]
-    if dish_vals.size == 0:
+    # Visible content mask (non-zero pixels in the masked half).
+    content = np.any(masked_half > 0, axis=2)
+    rows_with_content = np.where(content.any(axis=1))[0]
+    if rows_with_content.size == 0:
         return masked_half
-    dish_median = float(np.median(dish_vals))
+
+    # Seam position and scan direction.
+    if seam_side == "bottom":
+        seam_y = int(rows_with_content[-1])
+        scan_iter = range(seam_y, max(-1, seam_y - band_px - 1), -1)
+        far_cutoff = max(0, seam_y - band_px)
+    else:
+        seam_y = int(rows_with_content[0])
+        scan_iter = range(seam_y, min(h, seam_y + band_px + 1))
+        far_cutoff = min(h, seam_y + band_px)
+
+    # Brightness reference from the far half of the image (away from seam),
+    # so bar pixels don't drag down the dish median.
+    far_content = content.copy()
+    if seam_side == "bottom":
+        far_content[far_cutoff:, :] = False
+    else:
+        far_content[:far_cutoff, :] = False
+    far_vals = brightness[far_content] if far_content.any() else brightness[content]
+    if far_vals.size == 0:
+        return masked_half
+    dish_median = float(np.median(far_vals))
     if dish_median < 1.0:
         return masked_half
-
-    thresh = dish_median * dark_frac
-
-    half_mask = np.any(masked_half > 0, axis=2)  # rows that have content
-    active_rows = np.where(half_mask.any(axis=1))[0]
-    if active_rows.size == 0:
-        return masked_half
-
-    if seam_side == "bottom":
-        scan_start = max(int(active_rows[-1]) - band_px, int(active_rows[0]))
-        scan_end   = int(active_rows[-1]) + 1
-    else:
-        scan_start = int(active_rows[0])
-        scan_end   = min(int(active_rows[0]) + band_px + 1, int(active_rows[-1]) + 1)
+    thresh = dish_median * float(dark_frac)
 
     out = masked_half.copy()
-    for y in range(scan_start, scan_end):
-        row_mask = inside[y]
-        if not np.any(row_mask):
-            continue
-        row_med = float(np.median(brightness[y, row_mask]))
-        if row_med < thresh:
-            out[y, :, :] = 0
 
-    band_mask = np.zeros((h, w), dtype=bool)
-    band_mask[scan_start:scan_end, :] = True
-    dark_band = inside & band_mask & (brightness.astype(np.float32) < float(thresh))
-    dark_band = cv2.morphologyEx(
-        (dark_band.astype(np.uint8) * 255),
+    # --- Pass 1: row-wise scan from seam inward ---
+    # Use p10 of VISIBLE pixels so a bar covering even a minority of the row
+    # is detected (median would miss it when bar < 50 % of row width).
+    consecutive_clean = 0
+    for y in scan_iter:
+        if y < 0 or y >= h:
+            continue
+        vis = content[y]
+        if not vis.any():
+            continue
+        row_p10 = float(np.percentile(brightness[y, vis], 10))
+        if row_p10 < thresh:
+            out[y, :, :] = 0
+            content[y, :] = False
+            consecutive_clean = 0
+        else:
+            consecutive_clean += 1
+            if consecutive_clean >= 5:
+                break  # stable clean region reached — stop scanning
+
+    # --- Pass 2: connected-component cleanup near new seam ---
+    content2 = np.any(out > 0, axis=2)
+    rows2 = np.where(content2.any(axis=1))[0]
+    if rows2.size == 0:
+        return out
+
+    if seam_side == "bottom":
+        seam2 = int(rows2[-1])
+        cc_start = max(0, seam2 - 80)
+        cc_end   = seam2 + 1
+    else:
+        seam2 = int(rows2[0])
+        cc_start = seam2
+        cc_end   = min(h, seam2 + 81)
+
+    dark_in_band = content2 & (brightness.astype(np.float32) < thresh)
+    dark_in_band[:cc_start, :] = False
+    dark_in_band[cc_end:, :] = False
+
+    dark_u8 = cv2.morphologyEx(
+        (dark_in_band.astype(np.uint8) * 255),
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (21, 5)),
-        iterations=1,
-    ) > 0
+        iterations=2,
+    )
 
-    n_total, lab = cv2.connectedComponents(dark_band.astype(np.uint8), connectivity=8)
-    n_lab = int(n_total - 1)
-    if n_lab > 0:
-        if seam_side == "bottom":
-            seam_rows = lab[max(scan_end - 3, scan_start):scan_end, :]
-        else:
-            seam_rows = lab[scan_start:min(scan_start + 3, scan_end), :]
-        touch_labels = set(int(v) for v in np.unique(seam_rows) if v > 0)
+    n_total, lab = cv2.connectedComponents(dark_u8, connectivity=8)
 
-        remove = np.zeros((h, w), dtype=bool)
-        for lbl in range(1, n_lab + 1):
-            ys, xs = np.where(lab == lbl)
-            if ys.size == 0:
-                continue
-            comp_w = int(xs.max() - xs.min() + 1)
-            comp_h = int(ys.max() - ys.min() + 1)
-            spans_like_bar = comp_w >= int(0.18 * w) and comp_w >= 4 * max(1, comp_h)
-            if lbl in touch_labels or spans_like_bar:
+    # "Near-seam" = within 7 % of image height; used for a slightly stricter test.
+    seam_reach = max(5, int(0.07 * h))
+    if seam_side == "bottom":
+        edge_check  = lab[max(0, seam2 - 3):seam2 + 1, :]
+        reach_check = lab[max(0, seam2 - seam_reach):seam2 + 1, :]
+    else:
+        edge_check  = lab[seam2:min(h, seam2 + 4), :]
+        reach_check = lab[seam2:min(h, seam2 + seam_reach + 1), :]
+    edge_labels  = set(int(v) for v in np.unique(edge_check)  if v > 0)
+    reach_labels = set(int(v) for v in np.unique(reach_check) if v > 0)
+
+    remove = np.zeros((h, w), dtype=bool)
+    for lbl in range(1, n_total):
+        ys_l, xs_l = np.where(lab == lbl)
+        if ys_l.size == 0:
+            continue
+        comp_w = int(xs_l.max() - xs_l.min() + 1)
+        comp_h = int(ys_l.max() - ys_l.min() + 1)
+        if lbl in edge_labels:
+            # Direct seam edge: remove if wide bar-like.
+            if comp_w >= int(0.06 * w) and comp_w >= 2 * max(1, comp_h):
                 remove |= (lab == lbl)
-        out[remove] = 0
+        elif lbl in reach_labels:
+            # Within seam reach but not touching edge: stricter aspect ratio to
+            # avoid removing elongated colonies close to the cut.
+            if comp_w >= int(0.06 * w) and comp_w >= 3 * max(1, comp_h):
+                remove |= (lab == lbl)
+        else:
+            # Far from seam: only remove if unmistakably bar-shaped.
+            if comp_w >= int(0.15 * w) and comp_w >= 5 * max(1, comp_h):
+                remove |= (lab == lbl)
+
+    out[remove] = 0
     return out
 
 
@@ -849,6 +981,16 @@ def mask_top_bottom_from_line(image_bgr, ellipse, p1, p2,
     m = (y2 - y1) / dx
     b = y1 - m * x1
 
+    # Pre-mask the full bar component (including angled/tapered ends) before
+    # applying the line-based cut, so no triangular remnants survive.
+    image_work = image_bgr
+    if brightness is not None:
+        bar_y_center = int(round((y1 + y2) / 2.0))
+        bar_comp = build_bar_mask(brightness, ellipse, bar_y_center)
+        if bar_comp.any():
+            image_work = image_bgr.copy()
+            image_work[bar_comp] = 0
+
     dish_mask = make_eroded_ellipse_mask((h, w), ellipse, BORDER_EROSION_PX)
     dish = dish_mask > 0
 
@@ -862,8 +1004,8 @@ def mask_top_bottom_from_line(image_bgr, ellipse, p1, p2,
 
     top_mask    = (top.astype(np.uint8) * 255)
     bottom_mask = (bottom.astype(np.uint8) * 255)
-    masked_top    = cv2.bitwise_and(image_bgr, image_bgr, mask=top_mask)
-    masked_bottom = cv2.bitwise_and(image_bgr, image_bgr, mask=bottom_mask)
+    masked_top    = cv2.bitwise_and(image_work, image_work, mask=top_mask)
+    masked_bottom = cv2.bitwise_and(image_work, image_work, mask=bottom_mask)
 
     if brightness is not None:
         masked_top    = cleanup_bar_remnants(
@@ -885,6 +1027,16 @@ def mask_top_bottom(image_bgr, ellipse, y_bar_top, y_bar_bot,
     """
     h, w = image_bgr.shape[:2]
 
+    # Pre-mask the full bar component (including angled/tapered ends) before
+    # the horizontal cut so neither half inherits triangular bar remnants.
+    image_work = image_bgr
+    if brightness is not None:
+        bar_y_center = (y_bar_top + y_bar_bot) // 2
+        bar_comp = build_bar_mask(brightness, ellipse, bar_y_center)
+        if bar_comp.any():
+            image_work = image_bgr.copy()
+            image_work[bar_comp] = 0
+
     bar_thickness = max(1, y_bar_bot - y_bar_top)
     adaptive_margin = max(
         margin,
@@ -902,8 +1054,8 @@ def mask_top_bottom(image_bgr, ellipse, y_bar_top, y_bar_bot,
     bottom_mask = dish_mask.copy()
     bottom_mask[:y_black_end, :] = 0
 
-    masked_top    = cv2.bitwise_and(image_bgr, image_bgr, mask=top_mask)
-    masked_bottom = cv2.bitwise_and(image_bgr, image_bgr, mask=bottom_mask)
+    masked_top    = cv2.bitwise_and(image_work, image_work, mask=top_mask)
+    masked_bottom = cv2.bitwise_and(image_work, image_work, mask=bottom_mask)
 
     if brightness is not None:
         masked_top    = cleanup_bar_remnants(

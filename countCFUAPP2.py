@@ -560,16 +560,36 @@ def _mean_region_area(bw: np.ndarray) -> float:
 def _filter_rim_blobs(
     bw: np.ndarray,
     border_px: np.ndarray,
-    n_border: int,
+    _n_border: int,
 ) -> np.ndarray:
-    if n_border <= 0 or not np.any(bw):
+    if not border_px.any() or not np.any(bw):
         return bw
     lab_rim = label(bw, connectivity=2)
     max_label = int(lab_rim.max())
     if max_label == 0:
         return bw
-    border_hits = np.bincount(lab_rim[border_px], minlength=max_label + 1)
-    remove_labels = np.flatnonzero(border_hits[1:] / float(n_border) >= 0.20) + 1
+    blob_sizes = np.bincount(lab_rim.ravel(), minlength=max_label + 1)
+    border_hits = np.bincount(lab_rim[border_px].ravel(), minlength=max_label + 1)
+    # Fraction of each blob's own pixels that fall inside the border zone.
+    # Old logic divided by total border pixels (n_border), so small rim arcs
+    # with e.g. 400px out of 200k border pixels = 0.2% never reached the 20%
+    # threshold.  Per-blob fraction correctly identifies blobs that live inside
+    # the rim shadow regardless of how large the border zone is.
+    frac = border_hits[1:] / np.maximum(blob_sizes[1:], 1).astype(float)
+    # Primary: blob ≥70% inside border → rim shadow artifact
+    rim_flag = frac >= 0.70
+    # Secondary: elongated arc (aspect elongation ≥0.60) with ≥50% in border
+    # catches thin horizontal bar-shadow arcs that hug the rim
+    arc_candidates = np.where((frac >= 0.50) & ~rim_flag)[0]
+    for idx in arc_candidates:
+        lbl = int(idx) + 1
+        ys, xs = np.where(lab_rim == lbl)
+        bb_h = int(ys.max() - ys.min() + 1)
+        bb_w = int(xs.max() - xs.min() + 1)
+        elongation = 1.0 - min(bb_h, bb_w) / max(bb_h, bb_w, 1)
+        if elongation >= 0.60:
+            rim_flag[idx] = True
+    remove_labels = np.where(rim_flag)[0] + 1
     if remove_labels.size == 0:
         return bw
     bw = bw.copy()
@@ -591,6 +611,27 @@ def _crop_to_nonzero_bbox(rgb: np.ndarray, pad: int = 2) -> np.ndarray:
     y1 = min(rgb.shape[0], y1 + pad)
     x1 = min(rgb.shape[1], x1 + pad)
     return rgb[y0:y1, x0:x1].copy()
+
+
+def _crop_to_nonzero_bbox_with_offset(
+    rgb: np.ndarray, pad: int = 2
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Like _crop_to_nonzero_bbox but also returns the (y0, x0) top-left offset
+    of the crop within `rgb`.  Used so callers can embed crop-space masks back
+    into the full-image canvas with correct spatial alignment."""
+    if rgb.size == 0:
+        return rgb, (0, 0)
+    m = np.any(rgb != 0, axis=2) if rgb.ndim == 3 else (rgb != 0)
+    ys, xs = np.where(m)
+    if ys.size == 0 or xs.size == 0:
+        return rgb, (0, 0)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0 = max(0, y0 - pad)
+    x0 = max(0, x0 - pad)
+    y1 = min(rgb.shape[0], y1 + pad)
+    x1 = min(rgb.shape[1], x1 + pad)
+    return rgb[y0:y1, x0:x1].copy(), (y0, x0)
 
 
 def derive_experiment_ids_for_name(name: Union[str, Path]) -> Tuple[str, Optional[str]]:
@@ -647,10 +688,16 @@ def _get_expts_from_detectdish(
     dish_mode: str,
     target_area_px2: float,
 ) -> List[Dict[str, np.ndarray]]:
+    full_shape = rgb.shape[:2]
+
+    def _make_item(src: np.ndarray) -> dict:
+        crop, (y0, x0) = _crop_to_nonzero_bbox_with_offset(src)
+        return {"expt": crop, "offset": (y0, x0), "full_shape": full_shape}
+
     if dish_mode == "pre_cropped":
-        return [{"expt": _crop_to_nonzero_bbox(rgb)}]
+        return [_make_item(rgb)]
     if dish_mode == "auto" and _looks_pre_cropped(rgb):
-        return [{"expt": _crop_to_nonzero_bbox(rgb)}]
+        return [_make_item(rgb)]
     import DetectDish
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     fixed_diameter_px = 2.0 * float(np.sqrt(float(target_area_px2) / np.pi))
@@ -658,10 +705,10 @@ def _get_expts_from_detectdish(
         bgr, fixed_diameter_px=fixed_diameter_px
     )
     if ellipse_final is None or masked_bgr is None:
-        return [{"expt": rgb}]
+        return [{"expt": rgb, "offset": (0, 0), "full_shape": full_shape}]
     masked_rgb = cv2.cvtColor(masked_bgr, cv2.COLOR_BGR2RGB)
     if dish_mode == "single":
-        return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+        return [_make_item(masked_rgb)]
 
     # --- Attempt to find a divider bar (half-dish split) ---
     split_result = None
@@ -691,7 +738,7 @@ def _get_expts_from_detectdish(
         )
 
     if split_result is None and bar_extents is None:
-        return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+        return [_make_item(masked_rgb)]
 
     if split_result is None:
         y0_bar, y1_bar = bar_extents
@@ -708,8 +755,8 @@ def _get_expts_from_detectdish(
     top_rgb = cv2.cvtColor(top_bgr, cv2.COLOR_BGR2RGB)
     bot_rgb = cv2.cvtColor(bot_bgr, cv2.COLOR_BGR2RGB)
 
-    top_crop = _crop_to_nonzero_bbox(top_rgb)
-    bot_crop = _crop_to_nonzero_bbox(bot_rgb)
+    top_item = _make_item(top_rgb)
+    bot_item = _make_item(bot_rgb)
 
     # ------------------------------------------------------------------
     # Validate the split: each half must own a meaningful fraction of the
@@ -724,15 +771,15 @@ def _get_expts_from_detectdish(
 
     total_dish_nz = float(np.count_nonzero(np.any(masked_rgb > 0, axis=2)))
     if total_dish_nz > 0:
-        top_nz = float(np.count_nonzero(np.any(top_crop > 0, axis=2)))
-        bot_nz = float(np.count_nonzero(np.any(bot_crop > 0, axis=2)))
+        top_nz = float(np.count_nonzero(np.any(top_item["expt"] > 0, axis=2)))
+        bot_nz = float(np.count_nonzero(np.any(bot_item["expt"] > 0, axis=2)))
         top_frac = top_nz / total_dish_nz
         bot_frac = bot_nz / total_dish_nz
         if top_frac < _MIN_HALF_FRAC or bot_frac < _MIN_HALF_FRAC:
             # Split is lopsided → false divider on a full dish
-            return [{"expt": _crop_to_nonzero_bbox(masked_rgb)}]
+            return [_make_item(masked_rgb)]
 
-    return [{"expt": top_crop}, {"expt": bot_crop}]
+    return [top_item, bot_item]
 
 # ===========================================================================
 # BLOCK 1 — Preprocessing
@@ -1621,9 +1668,9 @@ def _count_one_expt_hsv(
     dish_area = int(np.count_nonzero(dish_mask_orig))
     bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
-    # --- Rim filter: remove blobs that own ≥20% of the dish border zone ---
+    # --- Rim filter ---
     _large_mode = params.large_cfu_mode
-    _rim_iters = 25 if _large_mode else 12
+    _rim_iters = 25 if _large_mode else 20
     border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
     n_border = int(np.count_nonzero(border_px))
     bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
@@ -1726,7 +1773,7 @@ def predict_count_only_hsv(
         dish_area = int(np.count_nonzero(dish_mask_orig))
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
-        _rim_iters = 25 if _large_mode else 12
+        _rim_iters = 25 if _large_mode else 20
         border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
@@ -1827,10 +1874,10 @@ def predict_tuning_features(
         bw_clean = morpho_cleanup(bw_raw, params, dish_area=dish_area)
 
         # --- Rim filter ---
-        # Old file used 5 erosion iterations (~10px border zone); new default
-        # is 12 (~24px).  The wider zone trims or removes large colonies near
-        # the dish rim.  Restore the narrower zone for large-CFU mode only.
-        _rim_iters = 5 if _large_cfu_mode else 12
+        # Large-CFU mode uses a narrower zone (5px) because large colonies often
+        # grow right to the rim edge and a wide zone would clip them.
+        # Small-CFU mode uses 20px to cover the full rim shadow depth.
+        _rim_iters = 5 if _large_cfu_mode else 20
         border_px = dish_mask_orig & ~ndi.binary_erosion(dish_mask_orig, iterations=_rim_iters)
         n_border = int(np.count_nonzero(border_px))
         bw_clean = _filter_rim_blobs(bw_clean, border_px, n_border)
@@ -1980,9 +2027,23 @@ def count_cfu_app2(
 
         # Save the post-cleanup mask to the system temp dir so it never
         # appears in the user's output directory.
+        # The mask is saved at *crop* dimensions (matching the overlay TIF) so
+        # that the ColonyNet display in app.py can use it directly without any
+        # resize.  A companion JSON sidecar records where this crop sits inside
+        # the full source image so hybrid.py can re-embed it at the right offset.
+        offset_y, offset_x = item.get("offset", (0, 0))
+        full_H, full_W = item.get("full_shape", rgb.shape[:2])
         post_tif = Path(tempfile.gettempdir()) / (base.name + "__post.tif")
         save_tiff_rgb(post_tif, bw_post_rgb)
         out_paths.append(str(post_tif))
+
+        import json as _json
+        post_offset_json = Path(tempfile.gettempdir()) / (base.name + "__post_offset.json")
+        with open(post_offset_json, "w", encoding="utf-8") as _f:
+            _json.dump(
+                {"y0": offset_y, "x0": offset_x, "full_H": full_H, "full_W": full_W},
+                _f,
+            )
 
     if return_metadata:
         return {"out_paths": out_paths, "counts": counts}

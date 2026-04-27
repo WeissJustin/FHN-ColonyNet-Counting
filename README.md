@@ -102,7 +102,12 @@ More information and graphics of the setup in the Report that can be found above
  
 ## Demo
 
-[![Watch Demo](https://img.youtube.com/vi/C0_2JkhErnI/0.jpg)](https://youtu.be/C0_2JkhErnI)
+<p align="center">
+  <a href="https://youtu.be/C0_2JkhErnI">
+    <img src="https://img.youtube.com/vi/C0_2JkhErnI/0.jpg" alt="Watch Demo">
+  </a>
+</p>
+
 ---
  
 ## Acknowledgments

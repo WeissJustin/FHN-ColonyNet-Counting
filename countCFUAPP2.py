@@ -124,6 +124,7 @@ class TuningParams:
     uncountable_cutoff: int = 300
     uncountable_precheck_cutoff: int = 400
     large_cfu_mode: bool = False
+    mini_cfu_mode: bool = False
 
 
 CLASS_LARGE_THRESH = 0.0043
@@ -180,8 +181,60 @@ ws_gauss_sigma=0.3,
 uncountable_cutoff=300,
 uncountable_precheck_cutoff=400,
 large_cfu_mode=True,
+mini_cfu_mode=False,
 )
 
+
+# ---------------------------------------------------------------------------
+# Mini-CFU parameter profile
+# ---------------------------------------------------------------------------
+# Mini-CFU mode targets truly tiny colonies: radius ~3–10 px, area ~30–300 px².
+# These are smaller than what the default small-CFU path handles reliably.
+#
+# Why these values differ from default:
+#   min_object_area  : 90 → 12   — allow very small blobs through; circularity
+#                                   and local-contrast filters do FP rejection instead.
+#   hsv_open_disk_large: 16 → 5  — the 2× up-sample opening with disk(16) erases
+#                                   colonies whose radius is < 8 px; disk(5) is safe.
+#   hsv_close_disk_large: 10 → 3 — gap-repair dilation applied uniformly to all blobs
+#                                   in mini mode; small r prevents merging neighbours.
+#   h_ref_frac       : 0.12 → 0.06 — smaller h captures shallower dark spots as
+#                                   the reference for V-threshold calibration, making
+#                                   the HSV step sensitive to faint mini colonies.
+#   colony_circularity_min: 0.09 → 0.35 — agar-texture FP are non-circular; mini
+#                                   genuine colonies are compact blobs → stricter gate.
+#   hsv_err_tol      : 0.0061 → 0.006 — similar tolerance; combined with circularity
+#                                   and local-contrast post-filter we can afford to
+#                                   let slightly more through the V loop.
+MINI_CFU_PARAMS = TuningParams(
+hsv_v_start=0.35,
+hsv_v_step=0.02,
+hsv_v_min=0.15,
+hsv_s_min=0.00,
+hsv_err_tol=0.006,
+h_ref_frac=0.06,
+hsv_extent_min=0.25,
+hsv_open_disk_small=1,
+hsv_open_disk_large=5,
+hsv_close_disk_large=3,
+min_object_area=12,
+small_area_quantile=0.75,
+small_cluster_extent_min=0.20,
+nonsmall_cluster_ecc_min=0.99,
+nonsmall_cluster_extent_min=0.20,
+colony_circularity_min=0.35,
+ws_thresh_abs_frac=0.04,
+ws_gauss_sigma=0.5,
+uncountable_cutoff=500,
+uncountable_precheck_cutoff=600,
+large_cfu_mode=False,
+mini_cfu_mode=True,
+)
+
+# Mean blob area threshold for "mini" size-class label (px²).
+# Detected colony distributions with mean area ≤ this value are labelled
+# "mini" when mini mode is active; above it they are labelled "small".
+MINI_AREA_THRESH = 200
 
 
 @dataclass
@@ -701,7 +754,7 @@ def _get_expts_from_detectdish(
     import DetectDish
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     fixed_diameter_px = 2.0 * float(np.sqrt(float(target_area_px2) / np.pi))
-    masked_bgr, ellipse_final, brightness, _ = DetectDish.detect_plate_rgb(
+    masked_bgr, ellipse_final, brightness, _, erosion_px = DetectDish.detect_plate_rgb(
         bgr, fixed_diameter_px=fixed_diameter_px
     )
     if ellipse_final is None or masked_bgr is None:
@@ -724,6 +777,7 @@ def _get_expts_from_detectdish(
                 gap=DetectDish.BAR_SPLIT_MARGIN_PX,
                 bar_half_width=DetectDish.BAR_MAX_THICK_PX // 2,
                 brightness=brightness,
+                border_erosion_px=erosion_px,
             )
 
     bar_extents = None
@@ -749,6 +803,7 @@ def _get_expts_from_detectdish(
             y_bar_bot=y1_bar,
             margin=DetectDish.BAR_SPLIT_MARGIN_PX,
             brightness=brightness,
+            border_erosion_px=erosion_px,
         )
 
     top_bgr, bot_bgr = split_result
@@ -974,7 +1029,9 @@ def morpho_cleanup(bw: np.ndarray, params: TuningParams, dish_area: int = 0) -> 
             continue
         label_i = i + 1
         area = int(blob_areas[label_i])
-        if params.large_cfu_mode:
+        if params.large_cfu_mode or params.mini_cfu_mode:
+            # large: uniform large r for halos. mini: uniform small r (params.hsv_close_disk_large=3)
+            # so nearby tiny colonies are never fused by the gap-repair dilation.
             r = int(params.hsv_close_disk_large)
         else:
             r = 12 if area < 1500 else (6 if area < 8000 else int(params.hsv_close_disk_large))
@@ -1453,6 +1510,54 @@ def _blob_size_class_guess(expt_raw: np.ndarray) -> Tuple[str, float, float, flo
     cond3 = (n_local >= _COND3_NLOC_LO and n_local < _COND3_NLOC_HI and gray_std >= _COND3_STD_MIN)
     is_large = cond1 or cond2 or cond3
     return ("large" if is_large else "small"), float(edge_max), float(n_local), float(gray_std)
+
+
+# ---------------------------------------------------------------------------
+# Mini-mode local contrast filter
+# ---------------------------------------------------------------------------
+
+# How far to expand each blob to find its "ring" of surrounding background.
+_MINI_CONTRAST_RING_PX: int = 7
+# Minimum required (ring_mean − blob_mean) in gray_expt for a blob to be kept.
+# In gray_expt, colonies are DARK (low value) and agar is BRIGHT (high value).
+# The preprocessing amplifies local contrast, so genuine mini colonies show a
+# clear dark-centre / bright-ring gradient.  Agar-texture patches do not.
+_MINI_CONTRAST_MIN: float = 6.0
+
+
+def _mini_local_contrast_filter(
+    bw: np.ndarray,
+    gray_expt: np.ndarray,
+) -> np.ndarray:
+    """
+    Reject blobs that lack a genuine dark centre relative to local background.
+
+    After the HSV + morphological pipeline, agar-texture FP that are round
+    enough to pass the circularity gate are removed here: a real mini colony
+    is a dark spot in gray_expt, so its surrounding ring is brighter by at
+    least _MINI_CONTRAST_MIN DN.  Texture patches are locally flat → rejected.
+
+    Blobs with no accessible ring pixels (e.g. at image border) are kept so
+    we never silently drop edge colonies.
+    """
+    bw = bw.astype(bool)
+    if not np.any(bw):
+        return bw
+    lab = label(bw, connectivity=2)
+    keep = np.zeros_like(bw, dtype=bool)
+    foot = _disk(_MINI_CONTRAST_RING_PX)
+    for reg in regionprops(lab):
+        blob = (lab == reg.label)
+        ring = binary_dilation(blob, footprint=foot) & ~blob & (gray_expt != 0)
+        if not np.any(ring):
+            keep |= blob          # no ring available → keep conservatively
+            continue
+        blob_mean = float(np.mean(gray_expt[blob]))
+        ring_mean = float(np.mean(gray_expt[ring]))
+        # ring_mean > blob_mean ↔ colony core is darker than surroundings
+        if (ring_mean - blob_mean) >= _MINI_CONTRAST_MIN:
+            keep |= blob
+    return keep
 
 
 def _count_colonies_with_instances(
